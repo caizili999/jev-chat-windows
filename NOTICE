@@ -1,0 +1,85 @@
+本仓库是 **jev-chat-windows 的非官方修改版**
+（本修改版：https://github.com/caizili999/jev-chat-windows）
+
+它是第三方在下列上游项目基础上修改而来，**与原作者无隶属关系，也未获得原作者背书**。
+
+## 上游项目与版权
+
+```
+Jev 聊天助手 Windows 版 (jev-chat-windows)
+Copyright (c) 2026 rezoch340 and the jev-chat contributors
+https://github.com/jev-chat/jev-chat-windows
+
+Jev 聊天助手（安卓原版）
+Copyright (c) 2026 Finderchangchang and the jev-chat contributors
+https://github.com/jev-chat/jev-chat-jarvis
+```
+
+上游代码以 MIT 协议开源（见 LICENSE）。上游 NOTICE 的授权条款同样适用于本修改版：
+
+- 允许个人和商业使用、修改、再分发、集成到自有产品中，无需付费或事先授权。
+- 分发或商用时，**必须保留 LICENSE 与本 NOTICE 文件**，并在产品的「关于」页、说明文档或发布页中
+  注明出处。推荐写法：基于 jev-chat-windows（https://github.com/jev-chat/jev-chat-windows）二次开发。
+- **不得**使用「jev-chat-windows」「Jev 聊天助手」「jev-chat」名称或 chatjevs.com 域名暗示由原作者
+  出品或背书。本仓库是第三方修改版，不代表上游项目，也不是上游的官方发行版。
+- 本修改版自己新增/改动的部分，同样以 MIT 协议提供（见 LICENSE）。
+
+## 本修改版改了什么
+
+上游是「截图 + 本地 OCR → 生成候选回复 → 你手动发送」的完整流程。本修改版在上游基础上做了这些
+改动（逐条的来龙去脉见 docs/CHANGELOG.md）：
+
+- **自动发送**（默认关）：单聊对方找我 / 群里 @我 / 群里不@我也回，三条路可分别开关；发送前有可
+  取消的倒计时，输入框里已有内容时绝不发送。
+- **群聊「不@我也回」**：多一种群聊回复方式（不是替换 @我），并带一个「群里先安静几秒」的窗口，
+  避免群里刷屏时插话。
+- **聊天记录导出**（默认关）：把看过的对话按 `会话名/日期.csv` 落到本地，四列
+  `时间/方向/发送者/内容`，区分「对方 / 我 / 程序（自动发的）」。
+- **设置项语义修正**：「生成完等几秒再发」与「群里不@我时先安静几秒」的含义与界面标签对齐。
+- 若干健壮性修复（重试策略、打包、倒计时串台等）。
+
+如果你要的是上游原版，请直接去 https://github.com/jev-chat/jev-chat-windows 。
+
+## 第三方组件
+
+| 组件 | 许可证 | 备注 |
+| --- | --- | --- |
+| PySide6-Fluent-Widgets | GPLv3 | 非商用免费；商用需向 https://qfluentwidgets.com/price 购买商业授权 |
+| PySide6 | LGPL-3.0 | Qt for Python 官方绑定 |
+| RapidOCR (rapidocr-onnxruntime) | Apache-2.0 | 离线中文 OCR，全程本地 |
+| windows-capture | MIT | Windows Graphics Capture 的 Python 绑定 |
+| numpy | BSD-3-Clause | 帧处理 |
+| pillow | MIT-CMU | 仅 `probe/` 里生成合成图片时用 |
+| PyInstaller | GPL-2.0-or-later（含 bootloader 例外） | 只用于打包，不影响源码许可 |
+
+**注意**：Windows 发布包（PyInstaller 打的 zip）里打包了 PySide6-Fluent-Widgets，该组件是 GPLv3，
+非商用免费、商用需另外购买商业授权。因此**发布包整体受 GPLv3 约束**：想商用的人请自行向该组件作者
+购买商业授权，或者自己换掉这个组件，本项目不代为处理，也不对发布包能不能商用做任何保证。
+只从源码运行、不使用发布包的人不受这一条约束（源码本身仍是 MIT）。
+
+各组件的完整许可证文本以其官方发行包（PyPI / 官网）为准，本文件不逐一转载。
+
+---
+
+This repository is an **unofficial modified version of jev-chat-windows**
+(https://github.com/caizili999/jev-chat-windows). It is a third-party
+derivative work; it is not affiliated with, nor endorsed by, the original
+authors.
+
+Upstream: jev-chat-windows (https://github.com/jev-chat/jev-chat-windows),
+Copyright (c) 2026 rezoch340 and the jev-chat contributors; Jev decision
+engine and question set from jev-chat-jarvis
+(https://github.com/jev-chat/jev-chat-jarvis), Copyright (c) 2026
+Finderchangchang and the jev-chat contributors. Both are MIT licensed.
+
+When you distribute or commercialize this software or a derivative, keep the
+LICENSE and this NOTICE, and credit the source, e.g. "Based on
+jev-chat-windows (https://github.com/jev-chat/jev-chat-windows)". Do not use
+the project name, "Jev Chat Assistant", "jev-chat" or the chatjevs.com domain
+to imply endorsement by the original authors.
+
+Note: the Windows release zip bundles PySide6-Fluent-Widgets, which is
+licensed under GPLv3 (free for non-commercial use; a commercial license must
+be purchased separately, see https://qfluentwidgets.com/price). As a result
+the Windows release package as a whole is bound by GPLv3 terms. Running from
+source is unaffected — the source code itself remains MIT.

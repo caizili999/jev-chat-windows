@@ -1,0 +1,137 @@
+# 推 v* tag → 在 Windows 上从零构建 → 体检发布包 → 建 Release 并挂 zip。
+# 手动触发（Actions 页 → Release → Run workflow）只构建 + 体检 + 传 artifact，不发 Release，
+# 用来试打一包而不污染版本历史。
+#
+# 为什么必须有这一条：本地 dist/ 是你自己跑过的目录，里面有 config.json（my_name、中转地址）。
+# 「发布包只能来自 CI 的全新构建」不是洁癖，是唯一能保证不把自己的配置发出去的办法。
+#
+# 所有 run: 里都是纯 ASCII：Windows runner 默认 shell 是 pwsh，非 ASCII 字面量在解码那一步
+# 容易出岔子。校验规则里的中文（"聊天记录"）都放在 tools/check_release_bundle.py 里，
+# 那个文件是 UTF-8 的 Python 源码，稳。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (e.g. 1.2.3). Leave empty for 0.0.0-dev."
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # 建 Release / 传附件要用
+
+# 同一个 tag 连推两次只留最后一次，别两个 job 抢着建同一个 Release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"  # 跟 build.bat 里 uv venv --python 3.11 对齐
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # 走 bash 而不是默认的 pwsh：Git Bash 在 windows runner 上是预装的，
+      # 而 `&&` 这类写法在 PowerShell 5.1 上不成立，没必要去赌 runner 上是哪个版本。
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      # 版本号从 tag 来。workflow_dispatch 时 github.ref_type 是 branch，
+      # 取输入框的值，留空就是 0.0.0-dev（app/update.py 见到非纯数字版本会跳过更新检查，正好）。
+      # stem 是 zip 文件名用的部分：tag 上用原样（保留 v，README 里承诺的就是 jev-chat-windows-vX.Y.Z.zip），
+      # 手动触发时 ref_name 是分支名（main），拿它当文件名太难看，改拼 v+版本号。
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+            STEM="${GITHUB_REF_NAME}"
+          else
+            V="${{ github.event.inputs.version }}"
+            if [ -z "$V" ]; then V="0.0.0-dev"; fi
+            STEM="v$V"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "stem=$STEM" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $V (zip stem: $STEM)"
+
+      - name: Stamp version
+        run: python tools/set_version.py "${{ steps.ver.outputs.version }}"
+
+      # 离线回归：不联网、不碰真实微信、不碰真实 config（脚本自己把 settings._CONFIG 指到临时文件）。
+      # 放在构建前跑：3 分钟就能拦下的问题，别等 6 分钟的打包跑完才发现。
+      - name: Run offline regression checks
+        env:
+          QT_QPA_PLATFORM: offscreen  # 无头跑 Qt：不开真窗口，字体仍从系统加载
+        shell: bash
+        run: |
+          for f in check_auto_send check_draft_mode check_recorder check_retry \
+                   check_self_judge check_ui_layout check_overlay_runtime; do
+            echo "=== $f ==="
+            python "tools/$f.py" || exit 1
+          done
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller --noconfirm --clean jev.spec
+
+      # 最后一道闸：确认打出来的东西里没有你自己的数据。
+      # 会拦下 config.json / 聊天记录 / *.csv / *.log / .env，并确认 OCR 模型、
+      # windows_capture、qfluentwidgets 资源都在（少一个就是「双击 exe 立刻炸」）。
+      - name: Verify bundle is clean and complete
+        run: python tools/check_release_bundle.py --expect-version "${{ steps.ver.outputs.version }}"
+
+      - name: Zip the bundle
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/jev-chat-windows `
+            -DestinationPath "jev-chat-windows-${{ steps.ver.outputs.stem }}.zip" `
+            -CompressionLevel Optimal
+          Get-Item "jev-chat-windows-${{ steps.ver.outputs.stem }}.zip" | Select-Object Name, Length
+
+      # 手动触发：只留 artifact，不发 Release
+      - name: Upload artifact (manual runs only)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jev-chat-windows-${{ steps.ver.outputs.version }}
+          path: jev-chat-windows-${{ steps.ver.outputs.stem }}.zip
+          retention-days: 7
+
+      # tag 触发：建 Release 并挂上 zip。用 runner 自带的 gh，不引第三方 action。
+      # --generate-notes 按 commit 自动列变更；docs/CHANGELOG.md 是人工版本，两者互补。
+      # 先 view 再决定 create 还是 upload：同一个 tag 重跑时 Release 已经在了，
+      # 直接 create 会报 "already exists" 把整个 job 判失败。
+      - name: Create release and attach zip
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          ZIP="jev-chat-windows-${GITHUB_REF_NAME}.zip"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists, re-uploading asset"
+            gh release upload "${GITHUB_REF_NAME}" "$ZIP" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "$ZIP" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

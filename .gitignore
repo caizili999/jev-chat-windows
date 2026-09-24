@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# 每个人自己的关系设置，不进仓库（.gitignore 里 # 只能整行注释，写在模式后面会变成模式的一部分）
+config.json
+# 导出的聊天记录：是你自己的对话内容，绝不进仓库
+聊天记录/
+# 根目录下的临时截图（docs/ 里的照常提交）
+/*.png
+wechat_probe.png
+
+# PyInstaller 产物（jev.spec 是源文件，照常提交）
+build/
+dist/
+*.spec.bak
+
+# AI 助手的工作记忆：含本机路径、真实昵称和内部讨论，**绝不进仓库**
+.workbuddy-ai/
+.claude/
+.cursor/
+
+# 密钥/环境/日志/打包件：一律不进仓库
+.env
+.env.*
+*.log
+*.zip
+
+# 发布前内部清单，不进仓库
+docs/PUBLISHING.md
