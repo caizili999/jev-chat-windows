@@ -82,6 +82,7 @@ jobs:
       - name: Run offline regression checks
         env:
           QT_QPA_PLATFORM: offscreen  # 无头跑 Qt：不开真窗口，字体仍从系统加载
+          PYTHONIOENCODING: utf-8  # runner 控制台是 cp1252，脚本 print 中文会 UnicodeEncodeError
         shell: bash
         run: |
           for f in check_auto_send check_draft_mode check_recorder check_retry \

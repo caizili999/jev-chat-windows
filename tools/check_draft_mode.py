@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import sys
@@ -26,6 +27,11 @@ import textwrap
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+
+# 输出强制 UTF-8。Windows 上 stdout 的编码跟着控制台代码页走（中文系统 cp936、CI 的
+# GitHub runner 是 cp1252），cp1252 编不出中文，脚本会在 print 那一行直接 UnicodeEncodeError。
+# 跟其它 check_*.py 保持同一写法，别只在本地能跑。
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 
 def _load_pure(path: str, name: str):

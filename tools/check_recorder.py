@@ -5,6 +5,7 @@
 不联网、不起 Qt 窗口（Reader 那部分用假的 OCR 结果喂进去，不加载模型）。
 """
 import csv
+import io
 import json
 import os
 import queue
@@ -16,6 +17,11 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 输出强制 UTF-8。Windows 上 stdout 的编码跟着控制台代码页走（中文系统 cp936、CI 的
+# GitHub runner 是 cp1252），cp1252 编不出中文，脚本会在 print 那一行直接 UnicodeEncodeError。
+# 跟其它 check_*.py 保持同一写法，别只在本地能跑。
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import numpy as np  # noqa: E402
 
