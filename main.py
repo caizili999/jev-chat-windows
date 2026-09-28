@@ -20,6 +20,9 @@ from collections import deque
 from app import recorder, settings, update, worker
 from app.capture import find_wechat_hwnd
 from app.fill import fill, send_text
+from app.kb import KbStore
+from app.kb.context import as_knowledge
+from app.kb.context import build as build_context
 from app.overlay import AUTO_CONFIG_REASONS, Overlay, at_me, auto_pick
 from app.version import VERSION
 from core.engine import analyze
@@ -40,6 +43,10 @@ state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
 # 聊天记录导出器。开关关着时是 None——不建它，连去重窗口都不占内存。
 # 它跟分析、自动发送完全并行：那边一行都不读它，它写盘失败也绝不往外抛。
 history_rec = None
+# 知识库（本机 `知识库/` 目录）。**加这个功能之前的所有行为都靠它保持原样**：
+# 里面没东西时，每次分析注入的知识库上下文就是空的（见 build_knowledge），
+# 发出去的请求跟以前一个字节都不差。
+kb_store = None
 _self_judge_noticed = False  # 自判模式只提示一次，别每轮都刷状态栏
 _PHASE_TEXT = {"draft": "正在起草候选回复…", "judge": "正在判断和排序…"}
 results = queue.Queue()
@@ -109,7 +116,34 @@ def report_phase(name):
     phase_q.put(name)
 
 
-def analyze_bg(msgs, title, revision, reply_to=None):
+def build_knowledge(title, msgs):
+    """这一轮分析要额外带上的知识库内容（联系人关系 / 命中的笔记 / 更早的历史）。
+
+    返回 core 认的那个普通 dict，或 **None**——None 表示「没有知识库」，core 那边走的
+    是加这个功能之前一模一样的老路（连字段都不出现在请求里）。
+
+    ⚠️ 有副作用：开着「记录聊天历史」且匹配到联系人时，会把这一屏追加进那个联系人的历史。
+    所以它必须**每次分析前调一次、且只调一次**（上游就是记录与注入共用一个入口）。
+
+    知识库出任何问题都不该拦住回复：坏掉的 JSON、写不进去的盘，全都吞掉记一行日志，
+    然后按「这一轮没有知识库」继续——回复能不能发出去，跟知识库没关系。
+    """
+    if kb_store is None:
+        return None
+    try:
+        ctx = build_context(kb_store, title, msgs, app="wechat",
+                            history_enabled=settings.kb_history_enabled(),
+                            history_count=settings.kb_history_count())
+    except Exception as e:  # noqa: BLE001
+        ov.log(f"[知识库] 组装上下文失败：{type(e).__name__}: {e}")
+        return None
+    # 界面上那行「本轮已带上 N 条笔记、M 条历史」——用户开了知识库之后，这是他唯一能当场
+    # 确认「真的用上了」的地方。0/0 时界面会明确写「本轮未使用知识库」。
+    ov.set_context_info(len(ctx.notes), len(ctx.history))
+    return as_knowledge(ctx)
+
+
+def analyze_bg(msgs, title, revision, reply_to=None, knowledge=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。
 
     错误分两路：JevError 是「对端明确回了什么」（带 HTTP 状态码 + 一句短提示 + 重试次数），
@@ -134,6 +168,7 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    timeout=settings.draft_timeout(),
                                    judge_timeout=settings.judge_timeout(),
                                    candidate_count=settings.candidate_count(),
+                                   knowledge=knowledge,
                                    on_phase=report_phase),
                      title, revision, None))
     except JevError as e:
@@ -156,14 +191,28 @@ def start_analyze(title, msgs, auto_ok=False):
     if problem:
         ov.set_status(problem + "，去设置里补上", "warning")
         return
+    # 知识库上下文在主线程这里建：它要读几份 JSON、还可能追加一屏历史（见 build_knowledge）。
+    # 放在 draft_problem 之后，是为了「压根不会发起分析」时不留任何磁盘痕迹——跟上游一样，
+    # 只有真要调模型了才建。返回值是 None 时整条链跟加这个功能之前完全一致。
+    knowledge = build_knowledge(title, msgs)
     state["busy"] = True
     ov.set_busy(True)
     # 这一轮该不该考虑自动发送。记在会话上而不是结果里：结果是从线程回来的，多带一个字段
     # 会让那条定长元组（kind, r, title, revision, info）到处都要改。
     chat_of(title)["auto"] = auto_ok
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
-    threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),
+    threading.Thread(target=analyze_bg,
+                     args=(msgs, title, chat_of(title)["rev"], reply_to, knowledge),
                      daemon=True).start()
+
+
+def on_kb_change():
+    """知识库内容变了（新建/编辑/删除/清空/一键存联系人）。界面自己会刷新，这里只做一件事：
+    把 store 攒下的提示取出来写进日志——「写不进去」「文件坏了」这类问题不该无声无息。"""
+    if kb_store is None:
+        return
+    for line in kb_store.take_problems():
+        ov.log(f"[知识库] {line}")
 
 
 def on_target_change(title, name):
@@ -546,6 +595,11 @@ def tick():
             # 把那份可能手工能救回来的文件覆盖掉。这条提示就是那个缺口。
             ov.log(f"[配置] {line}")
             ov.set_status("config.json 读不出来，这次按默认值运行（详见聊天记录）", "warning")
+        if kb_store is not None:
+            for line in kb_store.take_problems():
+                # 知识库是**可选**的一层，坏掉不该抢状态栏（用户可能压根没用它）——
+                # 但必须留在日志里，否则「我明明写了笔记却没带上」永远查不出原因。
+                ov.log(f"[知识库] {line}")
         # 生成进度（起草 → 判断）。分阶段报出来，是因为「整理回复慢」有一大半来自第二次模型调用，
         # 而用户只看到一句「正在整理」，根本不知道钱和时间花在哪一步。状态栏那行只有二十来字，
         # 所以就写「正在起草…」/「正在判断…」。
@@ -594,11 +648,15 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     # 输入框监视的开关，跟 capture_on 分开：自动发送默认关着，没开的人不该白付这份计算。
     # 用户在设置页打开自动发送时，sync_watch_input() 会把它置位，子进程下一圈就开始盯。
     watch_input = multiprocessing.Event()
+    # 知识库：进程级的唯一一份 store，界面和「每次分析前组装上下文」共用它。
+    # 目录不存在也没关系——不写就不建，没建过知识库的用户磁盘上不会多出任何东西。
+    kb_store = KbStore(settings.kb_dir())
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change,
                  result_of=lambda t: chats.get(t, {}).get("result"),
                  on_auto_send=auto_send_reply, on_settings_change=on_settings_change,
-                 on_toggle_judge=on_toggle_judge)
+                 on_toggle_judge=on_toggle_judge,
+                 kb=kb_store, on_kb_change=on_kb_change)
     child = None
     sync_watch_input()  # 上次是开着自动发送的话，这次一启动就盯上
     sync_history()  # 上次开着聊天记录的话，这次一启动就接着记

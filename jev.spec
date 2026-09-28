@@ -29,6 +29,9 @@ hiddenimports = [
     # 父进程这边 engine 也是运行时才走到，一并钉死，别指望静态分析都能扫出来
     "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update",
+    # 知识库：app.kb 那几个模块是 app.overlay 顺着 import 拉起来的，能静态扫到；钉死是防它
+    # 哪天改成惰性 import（比如按需才建管理窗口）之后，打包版静默少一个模块、点开就报错。
+    "app.kb", "app.kb.ui", "app.kb.store", "app.kb.context", "app.kb.selfcheck",
     "core.engine", "core.draft", "core.jev_client", "core.questions",
 ]
 datas, binaries = [], []

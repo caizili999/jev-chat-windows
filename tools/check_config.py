@@ -199,6 +199,68 @@ def check_key_encryption() -> None:
     print("密钥加密存储 ok（密文往返 / 明文兼容 / 解不开退空串 / 降级不丢 key）")
 
 
+def check_kb_settings() -> None:
+    """知识库那两个设置项：默认关、能往返、**不传时绝不清掉**、0 是合法值。
+
+    最后一条最容易踩：`kb_history_count` 的 0 表示「只记录不注入」，是**合法值**，
+    不能被当成「没设置」而退回默认 30——那会让用户明明关掉了注入、却还在发历史。
+    另外 `save()` 会重写整份 config.json，所以任何一个调用点漏传新参数都可能把它清成默认，
+    这条也必须钉住。
+    """
+    _fresh_dir()
+    # 默认值：历史默认关、注入条数默认 30
+    assert settings.kb_history_enabled() is False, "知识库历史必须默认关（要长期往磁盘写聊天内容）"
+    assert settings.kb_history_count() == 30, settings.kb_history_count()
+    # 目录就在程序目录下，跟 config.json 同级
+    assert settings.kb_dir() == os.path.join(settings._ROOT, "知识库"), settings.kb_dir()
+    assert os.path.dirname(settings.kb_dir()) == settings._ROOT
+
+    # 打开并设 50：要真的落盘、也要能读回来
+    settings.save(None, "朋友", kb_history_enabled_on=True, kb_history_count_n=50)
+    saved = json.load(open(settings._CONFIG, encoding="utf-8"))
+    assert saved["kb_history_enabled"] is True and saved["kb_history_count"] == 50, saved
+    assert settings.kb_history_enabled() is True and settings.kb_history_count() == 50
+
+    # **不传时保留**：别的调用点（悬浮窗、设置页）调 save() 时如果没带这两个参数，
+    # 绝不能把它们清回默认值——save() 是整份重写，漏一个键就是静默丢设置。
+    settings.save(None, "朋友", context_n=12)
+    assert settings.kb_history_enabled() is True, "save() 没传 kb 参数就把开关清掉了"
+    assert settings.kb_history_count() == 50, "save() 没传 kb 参数就把条数清掉了"
+    assert settings.context() == 12, "顺带确认这次确实走了 save()"
+
+    # 0 是合法值：只记录、不注入。不能退化成默认 30。
+    settings.save(None, "朋友", kb_history_count_n=0)
+    assert settings.kb_history_count() == 0, \
+        f"0 是合法值（只记录不注入），实际读回 {settings.kb_history_count()}"
+    assert json.load(open(settings._CONFIG, encoding="utf-8"))["kb_history_count"] == 0
+
+    # 越界夹取；脏值退默认
+    settings.save(None, "朋友", kb_history_count_n=9999)
+    assert settings.kb_history_count() == settings._MAX_KB_HISTORY
+    settings.save(None, "朋友", kb_history_count_n=-5)
+    assert settings.kb_history_count() == 0
+    for dirty in ("三十", None, [1], {}):
+        settings._write_config({"kb_history_count": dirty})
+        assert settings.kb_history_count() == settings._DEFAULT_KB_HISTORY, dirty
+
+    # 开关的脏值：除了 True 之外一律当 False（跟其它布尔开关一个口径）
+    settings._write_config({"kb_history_enabled": "yes"})
+    assert settings.kb_history_enabled() is True, "非空字符串在 bool() 下为真，跟别处一致"
+    settings._write_config({})
+    assert settings.kb_history_enabled() is False
+
+    # 加这两个键没有惊动任何已有键
+    settings._write_config({})
+    settings.save(None, "同事", 7, None, "deepseek", auto_send_dm_on=True, my_name_text="小金",
+                  candidate_count_n=1, kb_history_enabled_on=True, kb_history_count_n=20)
+    saved = json.load(open(settings._CONFIG, encoding="utf-8"))
+    assert saved["relationship"] == "同事" and saved["context"] == 7
+    assert saved["draft_provider"] == "deepseek" and saved["auto_send_dm"] is True
+    assert saved["my_name"] == "小金" and saved["candidate_count"] == 1
+    assert saved["kb_history_enabled"] is True and saved["kb_history_count"] == 20
+    print("知识库设置 ok（默认关 / 往返 / 不传时保留 / 0 是合法值 / 越界夹取 / 不动已有键）")
+
+
 def main() -> None:
     check_first_run_is_not_a_fault()
     check_atomic_write()
@@ -207,7 +269,8 @@ def main() -> None:
     check_corrupt_is_backed_up_not_destroyed()
     check_corrupt_config_falls_back_to_defaults()
     check_key_encryption()
-    print("配置持久化检查全部通过（原子写 / 坏文件备份与告警 / 密钥加密）")
+    check_kb_settings()
+    print("配置持久化检查全部通过（原子写 / 坏文件备份与告警 / 密钥加密 / 知识库开关）")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,9 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 # 不在布局里也正常的：顶层窗口自己 show()，布尔标志根本不是控件，定时器不是控件
-_ALLOWED = {"win", "_current", "_autoTimer"}
+# kbWindow 跟 win 同理——知识库是一个**独立的顶层窗口**（长文本编辑，需要宽度和高度，
+# 塞进悬浮窗那个 440 宽的页面栈里没法用），所以它本来就不该进任何布局。
+_ALLOWED = {"win", "kbWindow", "_current", "_autoTimer"}
 _LAYOUT_CALLS = ("addWidget", "addLayout", "addItem")
 
 

@@ -11,12 +11,17 @@
 演示设置只保存在内存，不读取真实密钥，也不修改环境变量或 config.json。
 --judge-engine / --judge-error 用来把三档（完整 / 自判 / 起草）和判断失败那一种界面都截出来；
 --auto-send 决定自动发送那两行开关开哪个（开着的档位才会露出倒计时秒数、发送键和群昵称）；
---state auto 额外把「N 秒后自动发送」那条倒计时摆出来。
+--state auto 额外把「N 秒后自动发送」那条倒计时摆出来；
+--kb 让知识库那一块出现（设置页那张卡 + 首页那行计数 +「存为联系人」按钮），
+--kb-window 直接把「知识库与联系人」管理窗口截下来。
+
+**知识库的演示数据建在临时目录里**（`--kb` 时），跟「不碰真实数据」这条承诺一致。
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -110,6 +115,29 @@ def _result(engine: str, judge_error: bool = False) -> dict:
             "scores": [0.21, 0.66, 0.13], "ranking": None, "answers": dict(_ANSWERS)}
 
 
+def _demo_kb_store():
+    """演示用的知识库：建在临时目录上，塞几条明显虚构的笔记和联系人。
+
+    **绝不用真实 store**：截图会进 README，真实笔记里可能有任何东西。临时目录不删也行——
+    进程退出后由系统回收，而这里刻意不碰用户的 `知识库/`。
+    """
+    from app.kb import KbStore
+    from app.kb.models import Contact, Note
+
+    store = KbStore(tempfile.mkdtemp(prefix="jev_preview_kb_"))
+    store.save_note(Note(id="d1", title="口味忌口", content="不吃香菜，海鲜过敏",
+                         tags=["吃饭", "点菜"], always_on=False))
+    store.save_note(Note(id="d2", title="我的基本情况", content="住在示例市，周末一般有空",
+                         tags=[], always_on=True))
+    store.save_note(Note(id="d3", title="项目代号", content="内部把那个项目叫「小蓝」",
+                         tags=["项目"], always_on=False))
+    store.save_contact(Contact(id="dc1", name="示例群", aliases=["示例群（12）"], apps=["wechat"],
+                               relationship="同事，带我做项目的组长",
+                               notes="喜欢直接说事，别绕圈子"))
+    store.save_contact(Contact(id="dc2", name="张三", apps=["wechat"], relationship="同事"))
+    return store
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="用合成聊天预览 Qt UI；绝不采集、联网或填入真实微信。"
@@ -129,7 +157,14 @@ def main() -> int:
                         default="off",
                         help="自动发送那几个开关的演示状态（决定倒计时/发送键/群昵称露不露出来）："
                              "dm=单聊、group=群里@我、any=群里不@我也回、both=dm+group、all=三条路全开")
+    parser.add_argument("--kb", action="store_true",
+                        help="让知识库那一块出现（设置页那张卡 + 首页那行计数 +「存为联系人」按钮）。"
+                             "演示数据建在临时目录里，不碰真实的 知识库/ 目录")
+    parser.add_argument("--kb-window", action="store_true",
+                        help="截图时改截「知识库与联系人」管理窗口（隐含 --kb）")
     args = parser.parse_args()
+    if args.kb_window:
+        args.kb = True
     if args.state == "auto" and args.auto_send == "off":
         args.auto_send = "dm"  # 倒计时条只在开了自动发送时才有意义，别拍出一张自相矛盾的图
     dm_on = args.auto_send in ("dm", "both", "all")
@@ -153,7 +188,10 @@ def main() -> int:
                      # 聊天记录导出。**路径必须给假的**：真值是本机的绝对路径，截图要进 README，
                      # 把自己机器上的目录结构贴到网上没有任何好处。
                      "save_history": True,
-                     "history_dir": r"C:\Apps\jev-chat-windows\聊天记录"}
+                     "history_dir": r"C:\Apps\jev-chat-windows\聊天记录",
+                     # 知识库那两格。**必须桩掉**：不桩的话 _load_settings() 会去读真实的
+                     # config.json，把用户自己的知识库开关状态拍进演示图里。
+                     "kb_history_enabled": args.kb, "kb_history_count": 30}
 
     # 形参必须跟 settings.save() 一一对应：少一个，设置页一点「保存设置」就会 TypeError，
     # 然后被 _save() 的 except 吞成「保存失败，请检查配置文件是否可写」——一个很难查的假故障。
@@ -167,7 +205,8 @@ def main() -> int:
                            send_key_text=None, my_name_text=None, draft_timeout_n=None,
                            judge_timeout_n=None, candidate_count_n=None,
                            auto_send_group_any_on=None, auto_send_any_wait_n=None,
-                           save_history_on=None):
+                           save_history_on=None,
+                           kb_history_enabled_on=None, kb_history_count_n=None):
         if key:
             demo_settings["has_key"] = True
         demo_settings["relationship"] = relationship_text
@@ -217,6 +256,10 @@ def main() -> int:
             demo_settings["judge_timeout"] = int(judge_timeout_n)
         if candidate_count_n is not None:
             demo_settings["candidate_count"] = int(candidate_count_n)
+        if kb_history_enabled_on is not None:
+            demo_settings["kb_history_enabled"] = bool(kb_history_enabled_on)
+        if kb_history_count_n is not None:
+            demo_settings["kb_history_count"] = int(kb_history_count_n)
         if auto_send_group_any_on is not None:
             demo_settings["auto_send_group_any"] = bool(auto_send_group_any_on)
         if auto_send_any_wait_n is not None:
@@ -271,6 +314,9 @@ def main() -> int:
         draft_timeout=lambda: demo_settings["draft_timeout"],
         judge_timeout=lambda: demo_settings["judge_timeout"],
         candidate_count=lambda: demo_settings["candidate_count"],
+        # 知识库那两格同理：不桩就会去读真实 config.json。
+        kb_history_enabled=lambda: demo_settings["kb_history_enabled"],
+        kb_history_count=lambda: demo_settings["kb_history_count"],
         save=save_demo_settings,
     ):
         from PySide6.QtCore import QTimer
@@ -293,10 +339,14 @@ def main() -> int:
             ))
 
         # 只有当前会话有结果，切到另一个会话就是空态——跟真实情况一致
+        demo_kb = _demo_kb_store() if args.kb else None
         ov = Overlay(on_fill=simulate_fill, result_of=lambda t: result if t == _CHAT else None,
                      on_auto_send=simulate_auto, on_settings_change=lambda: None,
                      on_toggle_judge=lambda on: ov.set_status(
-                         "演示模式：判断已" + ("开启" if on else "关闭") + "（未写配置）。", "success"))
+                         "演示模式：判断已" + ("开启" if on else "关闭") + "（未写配置）。", "success"),
+                     kb=demo_kb,
+                     on_kb_change=lambda: ov.set_status("演示模式：知识库内容已变（未写真实文件）。",
+                                                        "success"))
         ov.win.setWindowTitle("WeChatJev · 界面演示（合成数据）")
 
         if args.state == "setup":
@@ -311,6 +361,10 @@ def main() -> int:
             ov.set_chat(_CHAT)
             ov.show(result)
             ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
+            if args.kb:
+                # 首页那行「本轮已带上 N 条笔记、M 条历史」。真程序里由 main.build_knowledge()
+                # 每次分析前推过来；演示里写死一个数，好让这一行在截图里不是空的。
+                ov.set_context_info(2, 5)
             # 演示用的「有新版本」提示。地址指向本项目自己的仓库，别写成上游——
             # 截图里虽然只渲染「去下载」四个字，但源码里的地址会被读者当成真实更新源。
             ov.set_update("9.9.9", "https://github.com/caizili999/jev-chat-windows/releases/latest")
@@ -341,15 +395,22 @@ def main() -> int:
             def save_screenshot():
                 nonlocal exit_code
                 try:
-                    if args.scroll_bottom or args.scroll is not None:
-                        bar = ov.pages.currentWidget().verticalScrollBar()
-                        if args.scroll_bottom:
-                            bar.setValue(bar.maximum())
-                        else:
-                            bar.setValue(int(bar.maximum() * max(0, min(100, args.scroll)) / 100))
+                    if args.kb_window:
+                        # 管理窗口是**独立的顶层窗口**，要截的是它，不是悬浮窗
+                        ov._open_kb()
                         ov.app.processEvents()
+                        shot = ov.kbWindow
+                    else:
+                        shot = ov.win
+                        if args.scroll_bottom or args.scroll is not None:
+                            bar = ov.pages.currentWidget().verticalScrollBar()
+                            if args.scroll_bottom:
+                                bar.setValue(bar.maximum())
+                            else:
+                                bar.setValue(int(bar.maximum() * max(0, min(100, args.scroll)) / 100))
+                            ov.app.processEvents()
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    if not ov.win.grab().save(str(target), "PNG"):
+                    if not shot.grab().save(str(target), "PNG"):
                         raise OSError(f"无法保存截图：{target}")
                     print(f"已保存合成界面截图：{target}")
                 except OSError as exc:

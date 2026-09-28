@@ -9,6 +9,7 @@
 - [模型](#模型)
 - [为什么走 OCR](#为什么走-ocr)
 - [为什么起草不那么像 AI](#为什么起草不那么像-ai)
+- [知识库与联系人](#知识库与联系人)
 - [项目结构](#项目结构)
 
 ## 工作原理
@@ -21,6 +22,8 @@ WGC 截微信窗口（GPU 合成窗口也能截，被遮挡也能截）
   → 按气泡颜色分 me / her，灰字（引用块、时间戳、群里的发言人名、链接卡片）过滤掉，
     发言人名摘出来挂到它下面那条消息上
   → 跟上一帧比，滚动翻出来的旧消息不重复上报
+  → 组装知识库上下文（可选，建过才有）：按会话标题精确匹配联系人、按标签/标题命中笔记、
+    回注更早的历史（默认关），合起来不超过 1500 字；没建过就是空，请求体一个字节都不多
   → 冒出新的 her 消息才调 core.engine.analyze()
   → 起草 3 条候选（条数可在设置里调到 1~3）
   → 判断那一档（设置里选，或标题栏一键切）：
@@ -85,6 +88,64 @@ WGC 截微信窗口（GPU 合成窗口也能截，被遮挡也能截）
   「说话风格」再补一句你自己的描述。
 - 收尾还做了清洗：剥掉编号、方括号、引号和照抄的「me:」前缀，去掉句尾句号（`？！～` 留着，那是语气）。
 
+## 知识库与联系人
+
+上游 Jarvis v1.3 那一档。这里记的是**为什么这么写**，用法看 [README](../README.md)。
+
+**它必须是隐形的。** 这是这一轮最硬的约束：没建过知识库的用户，界面要跟以前一个像素不差，
+发出去的请求要跟以前**逐字节相同**。做法是把「有没有知识库」变成显式的两态，而不是到处塞 `if`：
+
+- 界面侧：`Overlay(kb=None)` 时设置页那张卡、首页那行计数、「存为联系人」按钮**全部 hide**
+  （不是留着占位置）。几个离线工具就是这么构造 Overlay 的，它们的界面因此完全没变。
+- 数据侧：`main.build_knowledge()` 在没有 store 时返回 `None`。`None` 一路传到 `core`，
+  `core/questions.knowledge_parts(None)` 返回 `("", [])`，`build_state()` 就**根本不写**
+  `background` / `history` 这两个键——请求体因此跟以前一模一样。这条由 `check_kb_inject.py`
+  钉着（`set(state) == {"chat"}`）。
+- 题干侧：`BACKGROUND_NOTE`（「背景里给的是上下文，不是跑题」）是**有条件**追加的——
+  上游无条件追加，这里只在真有背景时才加。差别是刻意的：无条件加会改掉那句已经校准过的题干，
+  而无库用户的请求必须一字不差。
+
+**`core/` 不能反向 import `app/`**（分层是单向的），所以交接面是一个**普通 dict**：
+`app/kb/context.as_knowledge(ctx)` → `{"background": str, "history": [{from, text}]}`。
+`core` 只认这个形状，认不出（`None`、`{}`、别的东西）就当没有知识库。这样做还有一个好处：
+这个边界能离线测，不需要 Qt、不需要起界面。
+
+**4xx 防御性重试。** `background` / `history` 是**没被上游验证过**的字段（上游是安卓端，协议一样但
+实现不同）。所以带字段的请求如果被 4xx 拒了，脱掉这两个字段**再发一次**，题干本身不动。
+只有这一种情况会触发：无字段的 4xx 不重试（那本来就是重试没用的错），5xx 也不脱字段
+（那是服务端的事，不是字段的事）。
+
+**匹配刻意做得很笨很便宜。** 名字/别名**精确**匹配（归一化后），笔记**纯子串**匹配，
+没有 embedding、没有打分、不调模型、不出网。理由跟上游一致：这是「记住几条事实」，
+不是检索系统；一个会因为语义相似而误命中「常驻事实」的东西，比不命中更危险。
+
+**名字归一化的正则要兜底。** 去尾部群人数后缀用的是**交替**（`(?:\(|（)\s*\d+\s*(?:\)|）)`）
+而不是字符类——Android 的 ICU 不接受 `[(...)]` 这种写法，两边要一致就得这么写。
+另外整个编译包在 `_safe_regex()` 里：引擎不认这种写法时**降级成「只 trim + 小写」**，
+而不是让这个类在 import 期就炸掉。一个正则编译失败不该把每一次分析都拖死。
+
+**一屏 = 一个序列，不是一个集合。** 这是上游最绕的一段，照搬了。追加日志的单位是**整屏**，
+规则按顺序：跟上一屏完全相同 → 什么都不写；日志是空的 → 全写；日志尾部与这一屏的开头重叠 k 行
+（k>0）→ 只追加 `S[k:]`；k==0 且跟上一屏毫无交集 → 判定为「往上翻了」，不写；其余 → 全写。
+「毫无交集」那条是刻意的：往上翻时看到的是更早的消息，写进去会把顺序打乱。
+`screen_batch=False` 表示「手工注入的一行」，不参与这个比对。
+
+**预算裁剪的顺序是硬要求。** 常驻笔记豁免；超 1500 字先丢**最旧的历史**，再**整条**丢笔记
+（绝不截半条——半条事实比没有事实更容易误导）。历史去重也一样：必须
+`recent_log(...).filter(不在屏上).takeLast(n)`——**反过来会让当前屏上的消息吃掉配额**
+（要 30 条，实际只拿到「30 减去屏上那几条」）。
+
+**上游有一条死分支，照原样留着。** `KbStore.save_or_merge_contact()` 里那个
+「原始标题不在 known 里就加进别名」的分支**永远不成立**：能走到「并入」就说明归一化后的标题
+已经匹配上某个联系人，那它必然在 known 里。结果是「一键存」记不下新的拼写，别名只能手动编辑。
+没有擅自「修好」——修了就跟上游行为分叉了，而这属于产品决定，不是 bug 修复。代码里加了注释。
+
+**写盘一律原子，坏文件一律保全。** 临时文件 + fsync + `os.replace`；解析不了的旧文件改名成
+`*.corrupt.<时间戳>` 而不是静默覆盖（里面可能是用户唯一一份数据，手工修一下就能救回来）；
+**移不走的坏文件直接拒绝写入**（记进 `unreadable`，永不覆盖）——那比「写不进去」严重得多。
+
+**`KbStore` 用 `RLock` 是必需的。** `counts()` 会进 `_load_contacts()`，后者又进 `_load_log()`，
+普通 `Lock` 会自己把自己锁死（这个坑真踩到了）。
 
 ## 项目结构
 
@@ -96,6 +157,10 @@ main.py                 入口：父进程只管界面，子进程采集，队�
                         （会话没切、输入框是空的）
                         sync_history() 管记录器的建/收（开关关着时它就是 None，连去重窗口都不占内存）；
                         drain() 里只多一个分叉：history 照旧存三元组喂模型，带时间戳的那一份另给记录器
+                        build_knowledge() 是知识库进 core 的唯一出口：没 store 就返回 None（core 那侧
+                        因此连 background/history 两个键都不写），有 store 就组装上下文并把条数推给界面。
+                        它在 start_analyze() 里、draft_problem() 之后调用——只有真要调模型了才建，
+                        所以「压根不会发起分析」时不会留下任何磁盘痕迹
 app/                    UI + 采集层
   capture.py            找微信窗口 + WGC 盯帧 + 像素锚点定位消息区；帧全程内存。
                         另存一个 latest 帧，供输入框内容检测用（不能等 settled——你打字时消息区一像素不变）
@@ -114,6 +179,9 @@ app/                    UI + 采集层
                         不显示百分比、标签用「候选 N」；set_failed() 是失败收尾（恢复候选可点 + 展开日志面板）
                         自动发送的界面也在这里：begin_auto()/_auto_tick()/_cancel_auto() 是倒计时条，
                         _sync_auto_fields() 管两个开关的显隐联动，_sync_footer() 让页脚的承诺跟着开关变
+                        知识库那部分：kb=None 时相关控件全部 hide（这是「不改动现有行为」的界面侧做法）；
+                        _kb_hint() 点破「记录历史开着但条数是 0」这种跨字段的静默失效；
+                        set_context_info() 写首页那行「本轮已带上 N 条笔记、M 条历史」
   settings.py           四个 key 只进注册表，且**存的是 DPAPI 密文**（CryptProtectData，只有同一个
                         Windows 用户能解开；无前缀的旧值按明文读，兼容升级上来的老配置；
                         解不开返回空串而不是把密文当密钥发出去）；其余设置（含自定义地址/模型名/重试次数/判断引擎/自动发送/
@@ -138,7 +206,28 @@ app/                    UI + 采集层
                         记录是旁路，拖垮采集和自动发送才是真事故
   textsim.py            文本相似度（similar），**只依赖标准库**：ocr.py（子进程）和 recorder.py（主进程）
                         都要用它，留在 ocr.py 里会让主进程为了比两个字符串就 import 40MB 的 RapidOCR
-core/                   Jev 判断内核，平台无关，跟安卓原版同一套口径
+  kb/                   知识库与联系人（对齐上游 jev-chat-jarvis v1.3）。**整包默认不存在感**：
+                        没建过知识库时，界面控件全隐藏、请求体一个字节都不多
+    models.py           Note / Contact / LogEntry / ChatContext / KbCounts。JSON 字段名跟上游一字不差
+                        （alwaysOn / autoSummary / updatedAt …）。side_of() 把非 "me" 的一律归成 "her"
+    store.py            KbStore：`知识库/` 下几份 JSON 的读写。原子写（临时文件 + fsync + os.replace），
+                        坏文件改名留档成 *.corrupt.<时间戳>、移不走的坏文件拒绝写入（unreadable）。
+                        名字归一化（去零宽 + 去尾部群人数后缀 + trim + 小写）用 _safe_regex() 包着，
+                        引擎不认那种写法时**降级成 trim + 小写**而不是让整个类炸掉。
+                        RLock 是必需的——counts() 会再进 _load_log()，普通 Lock 会自己锁死自己
+    context.py          一次分析的上下文：联系人精确匹配 + 笔记子串命中 + 历史回注 + 1500 字预算。
+                        预算先丢最旧的历史、再整条丢笔记（绝不截半条），常驻笔记豁免。
+                        历史去重的顺序是硬要求：先按最宽窗口过滤、再 takeLast(n)——反过来会让
+                        当前屏上的消息吃掉配额。**有副作用**：会把这一屏追加进联系人的历史
+    selfcheck.py        设置页那个「自检」：六组探针（名字归一化 / 全角别名命中 / tag 命中 /
+                        历史去重且不重写 / background 带上了编造的事实 / 历史默认关），跑完自删
+    text.py             纯文本解析（**Qt-free**）：标签切分、导入块的按空行分段
+    ui.py               知识库与联系人窗口 + 几个对话框（**唯一依赖 Qt 的那个**）。另外对外只暴露
+                        confirm() / toast() 两个小入口，悬浮窗不用去碰 MessageBoxBase / InfoBar 的细节
+core/                   Jev 判断内核，平台无关，跟安卓原版同一套口径。
+                        **依赖是单向的：app/ → core/，core/ 绝不 import app/**。
+                        所以知识库交给 core 的是一个**普通 dict**（见 app/kb/context.as_knowledge），
+                        core 那侧只认这个形状（core/questions.knowledge_parts），认不出就当没有知识库
   engine.py             唯一入口 analyze(...) → 候选 + 判断；按 judge_engine 分三档路由，
                         判断失败时如实返回 judged=False + judge_error，但**候选照常给**（不连候选一起丢）
   judge.py              自判模式：走普通 /chat/completions + prompt 约束，用任意 OpenAI 兼容模型做判断和排序。
@@ -148,7 +237,11 @@ core/                   Jev 判断内核，平台无关，跟安卓原版同一�
                         请求头（request_headers：含必须显式带的 User-Agent）、状态码提示表、
                         重试策略（retryable_status + post_json）、响应体形状防御（parse_json）都在这，
                         起草和判断共用；JevError 带 status/hint/retries 三个字段供状态栏用；带 __main__ 自测
-  questions.py          7 道判断题 + build_state() + build_rank_question()
+  questions.py          7 道判断题 + build_state() + build_rank_question()；
+                        knowledge_parts(knowledge) 是**知识库进 core 的唯一入口**——只认
+                        {background, history} 这个普通 dict，认不出就返回 ("", [])；
+                        judge_questions(with_background) 决定题干尾部要不要追加 BACKGROUND_NOTE
+                        （**只在真有背景时才加**，见「知识库与联系人」）
   draft.py              起草 3 条候选（OpenRouter / DeepSeek 直连 / 自定义 OpenAI 兼容地址）；
                         _content() 把响应体形状错误转成带 hint 的 JevError，不让 KeyError 逃出去
 tools/
@@ -158,10 +251,12 @@ tools/
     for f in tools/check_*.py; do
       case "$f" in */check_release_bundle.py) continue ;; esac
       python "$f" || echo "FAIL $f"; done
-    Qt 那两份需要 QT_QPA_PLATFORM=offscreen（无显示器时）。
+    Qt 那几份需要 QT_QPA_PLATFORM=offscreen（无显示器时）。
   preview_ui.py         用合成数据预览界面，不采集不联网不碰微信；--screenshot 出图，
                         --judge-engine / --judge-error / --scroll-bottom 能把三档和判断失败那一种界面都截出来，
-                        --state auto / --auto-send 能把自动发送和倒计时条截出来
+                        --state auto / --auto-send 能把自动发送和倒计时条截出来，
+                        --kb / --kb-window 让知识库那一块出现并截出设置卡与管理窗口
+                        （知识库的演示数据建在临时目录里，不碰真实的 知识库/）
   make_icon.py          生成 docs/icon.ico（打包图标），图标已提交，换颜色才用重跑
   check_ui_layout.py    静态检查 overlay.py 里有没有「构造了控件但忘了加进布局」的属性
                         （Qt 里这种错是静默的：控件会变成飘在桌面上的顶层窗口，装不了 Qt 时只能静态查）
@@ -201,6 +296,40 @@ tools/
                         密钥 DPAPI 密文往返（密文里不含明文、历史明文照读、解不开退空串、
                         DPAPI 不可用时退回明文不丢 key）。
                         **绝不碰真实配置与注册表**；不需要 Qt、不联网
+  check_kb.py           知识库数据层离线回归（15 组）：名字归一化（半/全角人数 / 零宽 / 空白 / 大小写，
+                        含**正则降级**那条路）、坏文件保全（改名留档 + 之后能正常写）、移不走的坏文件
+                        拒绝覆盖、原子写不留 .tmp、一屏序列五条规则（同屏不重写 / 增量追加 / 上翻不写 /
+                        空白丢弃 / 手工注入）、历史上限 300 丢最旧、笔记命中（tag/标题 / 6 条窗口 /
+                        关掉的不算 / 上限 5 且新的优先）、预算裁剪（常驻豁免 / 先丢历史再丢笔记 /
+                        不截半条 / 不超不裁）、历史去重（先过滤再 takeLast / 短行不去重 / count=0 只记不注）、
+                        联系人（一键存 / 并入 / 去人数 / 来源优先 / **不自动创建** / 删人连带删历史）、
+                        background 格式（不重复默认关系 / 空则整个字段不发）、清空只删知识库目录、
+                        自检不留残渣、落盘字段名与上游一致、消息形状三种入参。
+                        全在临时目录里，跑完删掉；不需要 Qt、不联网
+  check_kb_inject.py    知识库注入端到端（6 组）：起一个本地 HTTP 桩，验**无库时请求体逐字节不变**
+                        （set(state) == {"chat"}）、有库时真的发出 background+history 且题干追加
+                        BACKGROUND_NOTE、带着字段被 4xx 拒了会**脱掉字段重发一次**、无字段的 4xx 不重试、
+                        5xx 不脱字段、真实 KbStore→ChatContext→请求体、判断上下文上限仍是 6 条。
+                        不需要 Qt、不出网（只连回环）
+  check_kb_ui.py        悬浮窗知识库接线离线回归（8 组）：kb=None 时设置页那张卡 / 首页那行计数 /
+                        「存为联系人」按钮**全隐藏**（这是「不改动现有行为」最直接的证据）、
+                        kb=store 时真挂上去且可见（父链通到设置页）、设置往返（含 **0 是合法值**，
+                        以及 save() 没漏掉别的键）、`kb_history_count` 的夹取与脏值、
+                        「记录历史开着 + 0 条」这条**跨字段静默失效**必须被 `_kb_hint` 点破、
+                        首页那行「本轮带了什么」的 0/0 与 N/M 两种文案、一键存联系人（没会话时不写、
+                        重复存不造第二条）、清空后**销毁那个已经建好的窗口**、自检不留残渣，
+                        以及 `main.build_knowledge` 两头都对（没 store 返回 None / 有 store 真带上
+                        background 与 history，形状是 core 认的 {from,text}）。
+                        **绝不碰真实配置与真实知识库**（config.json 指到临时文件、store 建在临时目录）；
+                        需要 PySide6
+  check_preview_ui.py   静态对账 tools/preview_ui.py 与 app/settings.py 的接口（纯 AST + inspect，
+                        不需要 Qt）。守两条**静默**的承诺：① `preview_ui` 的桩必须覆盖 overlay 里
+                        **每一个会读真实配置**的 `settings.xxx()` 调用——判据是「走到底会不会碰到
+                        `_cfg()` / `_get_key()` / 本机绝对路径 `_ROOT`」，且**遇到已经被桩掉的函数就停**
+                        （所以 `draft_problem()` 这种纯拼装的不会被误报）；漏一个不是报错，而是把用户
+                        自己的开关状态、甚至本机目录结构拍进公开的 README 截图里。② `save_demo_settings`
+                        要收得下 `_save()` 实际传的那些参数（5 个位置 + 25 个关键字），否则点一次
+                        「保存设置」就 TypeError，然后被吞成「保存失败，请检查配置文件是否可写」
 probe/                  一次性探针，结论已写进本文，留着是为了可复现
   probe_win.py          UIA 能不能读微信聊天文字 → 证伪（树是空的）
   probe_win2.py         UIA 证伪 v2：分清「树是空的」和「有树没文字」，顺带试 LegacyIAccessible
@@ -221,13 +350,16 @@ docs/ui_*.png           README 里那几张截图，tools/preview_ui.py --screen
 config.json             你自己的设置，不进仓库（在 .gitignore 里）
 聊天记录/                开了「保存聊天记录到本地」才会出现，按「会话名/日期.csv」分层。
                         是你自己的对话内容，**不进仓库**（也在 .gitignore 里）
+知识库/                  手写的笔记、联系人（关系/备注/别名），以及（默认关的）聊天历史。
+                        没建过就不会出现——不写就不建。同样**不进仓库**（也在 .gitignore 里）
 ```
 
 `tools/` 和 `probe/` 里的脚本都按「项目根在 `PYTHONPATH` 里」写（PyCharm 默认会把内容根加进去）。
 命令行跑 `tools/demo.py` 得自己带上：`set PYTHONPATH=. && python tools/demo.py`。
 
-自己把项目根插进 `sys.path` 的那几个（`check_auto_send` / `check_draft_mode` / `check_overlay_runtime` /
-`check_recorder` / `check_retry` / `check_self_judge` / `preview_ui`）：
+自己把项目根插进 `sys.path` 的那几个（`check_auto_send` / `check_draft_mode` / `check_kb` /
+`check_kb_inject` / `check_kb_ui` / `check_overlay_runtime` / `check_preview_ui` / `check_recorder` /
+`check_retry` / `check_self_judge` / `preview_ui`）：
 命令行直接跑就行，回归检查和看界面不该还要你先想起来设环境变量
 （`check_self_judge.py` 另外还自带一个本地桩服务）。`check_ui_layout.py`、`demo.py`、`make_icon.py`
 不走这条路，得自己带上 `PYTHONPATH`。`app/`、`core/`、`main.py` 里没有任何 `sys.path` 补丁。

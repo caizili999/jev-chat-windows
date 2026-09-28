@@ -26,6 +26,7 @@ _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
 _HISTORY_DIR = "聊天记录"  # 跟 config.json 同级，整个文件夹拷走记录也跟着走
+_KB_DIR = "知识库"        # 知识库与历史，同样跟 config.json 同级
 _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
 _DEFAULT_RETRIES = 2  # 失败后最多再试几次。跟 core.jev_client.DEFAULT_RETRIES 保持一致
@@ -56,6 +57,9 @@ _MAX_TIMEOUT = 120
 _DEFAULT_CANDIDATES = 3
 _MIN_CANDIDATES = 1
 _MAX_CANDIDATES = 3
+# 知识库：每次分析注入最近多少条历史。上限跟上游 ContextBuilder 一致（coerceIn(0, 100)）。
+_DEFAULT_KB_HISTORY = 30
+_MAX_KB_HISTORY = 100
 
 def _cfg() -> dict:
     """每次都重新读文件，改设置不用重启进程。读不到/坏了/不是对象一律当空配置，退回默认值。
@@ -315,6 +319,40 @@ def history_dir() -> str:
     """聊天记录的根目录。放在程序目录下（跟 config.json 同级），所以开发态是项目根、
     打包后是 exe 所在目录——不用 os.getcwd()，双击 exe 时那个可能是桌面。"""
     return os.path.join(_ROOT, _HISTORY_DIR)
+
+
+# ── 知识库 ──────────────────────────────────────────────────────────────────
+# 「知识库」是**可选**的一层：用户在设置里手写笔记、给会话建联系人（关系/备注/别名），
+# 分析时把命中的笔记和更早的历史一起带上。全部只存本机、不出网、有硬预算（见 app/kb/）。
+# 三个设置项都**不改动任何已有键**，老配置读上来行为跟以前完全一样。
+
+def kb_dir() -> str:
+    """知识库的根目录（`知识库/`），跟 config.json 同级——整个文件夹拷走知识库也跟着走。
+    目录不存在时上层会按需创建；这里只算路径，不碰磁盘。"""
+    return os.path.join(_ROOT, _KB_DIR)
+
+
+def kb_history_enabled() -> bool:
+    """要不要把聊天历史记进知识库、并在分析时带上最近若干条。**默认关。**
+
+    默认关的理由跟「保存聊天记录到本地」一样：它要长期往磁盘写聊天内容，
+    不该替用户默认打开。关着的时候知识库照样能用——手写的笔记和联系人照常注入，
+    只是不带历史。
+    """
+    return bool(_cfg().get("kb_history_enabled", False))
+
+
+def kb_history_count() -> int:
+    """每次分析注入最近多少条历史。0~100，默认 30。
+
+    0 是**合法值**（只记录、不注入），所以不能像别的开关那样「0 当缺省」——
+    这里只夹范围，脏值才退默认值。
+    """
+    try:
+        n = int(_cfg().get("kb_history_count", _DEFAULT_KB_HISTORY))
+    except (TypeError, ValueError):
+        return _DEFAULT_KB_HISTORY
+    return max(0, min(_MAX_KB_HISTORY, n))
 
 
 def auto_send_dm() -> bool:
@@ -597,7 +635,9 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
          judge_timeout_n: int | None = None, candidate_count_n: int | None = None,
          auto_send_group_any_on: bool | None = None,
          auto_send_any_wait_n: int | None = None,
-         save_history_on: bool | None = None) -> None:
+         save_history_on: bool | None = None,
+         kb_history_enabled_on: bool | None = None,
+         kb_history_count_n: int | None = None) -> None:
     """每个参数为 None = 保留当前值；字符串项传 "" 表示清掉。
 
     四个 key（OpenRouter / DeepSeek / 自定义 / 判断）都只写进程环境 + HKCU\\Environment，
@@ -634,6 +674,10 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
     any_wait = (auto_send_any_wait() if auto_send_any_wait_n is None
                 else max(0, min(_MAX_AUTO_DELAY, int(auto_send_any_wait_n))))
     hist = save_history() if save_history_on is None else bool(save_history_on)
+    kb_hist = (kb_history_enabled() if kb_history_enabled_on is None
+               else bool(kb_history_enabled_on))
+    kb_cnt = (kb_history_count() if kb_history_count_n is None
+              else max(0, min(_MAX_KB_HISTORY, int(kb_history_count_n))))
     skey = send_key_text if send_key_text in _SEND_KEYS else send_key()  # 脏值 = 保留原来的
     myname = my_name() if my_name_text is None else str(my_name_text).strip()
     dto = draft_timeout() if draft_timeout_n is None else max(_MIN_TIMEOUT, min(_MAX_TIMEOUT, int(draft_timeout_n)))
@@ -650,4 +694,5 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
                    "judge_engine": engine, "auto_send_dm": dm, "auto_send_group": grp,
                    "auto_send_group_any": any_on, "auto_send_any_wait": any_wait,
                    "auto_send_delay": delay, "send_key": skey, "my_name": myname,
-                   "draft_timeout": dto, "judge_timeout": jto, "candidate_count": cnt})
+                   "draft_timeout": dto, "judge_timeout": jto, "candidate_count": cnt,
+                   "kb_history_enabled": kb_hist, "kb_history_count": kb_cnt})

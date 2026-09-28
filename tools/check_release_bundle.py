@@ -8,8 +8,8 @@
 
 三件事：
   1. **源码树里没混进你自己的东西**（git ls-files，只查被跟踪的文件）——
-     config.json / 聊天记录 / .workbuddy-ai / .env 一旦进了 index，打包时就会跟着走。
-  2. **打出来的目录里没混进你自己的东西**（config.json / 聊天记录 / *.csv / *.log / .env）——
+     config.json / 聊天记录 / 知识库 / .workbuddy-ai / .env 一旦进了 index，打包时就会跟着走。
+  2. **打出来的目录里没混进你自己的东西**（config.json / 聊天记录 / 知识库 / *.csv / *.log / .env）——
      config.json 是你本机跑过这个 exe 之后留下的，里面有 my_name 和中转地址。
   3. **关键载荷还在**（OCR 模型、onnxruntime、qfluentwidgets 资源、windows_capture）——
      少一个就是「双击 exe 立刻炸」，别等用户来报。
@@ -43,6 +43,7 @@ FORBIDDEN_NAMES = {
     ".claude",
     ".cursor",
     "聊天记录",           # 导出的对话内容本体
+    "知识库",             # 手写的笔记、联系人备注、聊天历史，还有 *.corrupt.<时间戳> 备份
 }
 FORBIDDEN_SUFFIXES = {".csv", ".log"}
 FORBIDDEN_PREFIXES = (".env.",)  # .env.local / .env.production
@@ -100,7 +101,7 @@ def check_git_index() -> list[str]:
             if why:
                 problems.append(f"git 跟踪了 {path}（{why}）")
                 break
-    print(f"  [OK] index 干净：{len(tracked)} 个被跟踪文件，无 config.json / 聊天记录 / .env")
+    print(f"  [OK] index 干净：{len(tracked)} 个被跟踪文件，无 config.json / 聊天记录 / 知识库 / .env")
     return problems
 
 
@@ -127,7 +128,7 @@ def check_bundle(bundle: Path) -> tuple[list[str], list[str]]:
                 problems.append(f"混进了文件 {os.path.join(rel_dir, f)}（{why}）")
 
     if not problems:
-        print(f"  [OK] 包里干净：{n_files} 个文件，无 config.json / 聊天记录 / csv / log / .env")
+        print(f"  [OK] 包里干净：{n_files} 个文件，无 config.json / 聊天记录 / 知识库 / csv / log / .env")
 
     # 关键载荷
     missing = [(rel, desc) for rel, desc in REQUIRED if not (bundle / rel).exists()]
@@ -233,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ✗ {p}")
         print()
         print("怎么修：")
-        print("  - config.json / 聊天记录：从源码树和 dist 里删掉。dist 那份是本机跑过 exe 留下的，")
+        print("  - config.json / 聊天记录 / 知识库：从源码树和 dist 里删掉。dist 那份是本机跑过 exe 留下的，")
         print("    重新打一次包就没有了（PyInstaller 不会复制它）。")
         print("  - 已进 git index：git rm --cached <路径>，再确认 .gitignore 里有对应规则。")
         return 1

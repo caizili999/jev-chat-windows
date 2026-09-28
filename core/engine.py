@@ -15,12 +15,14 @@ try:
     from .draft import draft_candidates
     from .jev_client import DEFAULT_RETRIES, JevError, ask
     from .judge import judge as self_judge
-    from .questions import JUDGE_QUESTIONS, build_rank_question, build_state
+    from .questions import (build_rank_question, build_state,
+                            judge_questions, knowledge_parts)
 except ImportError:
     from draft import draft_candidates
     from jev_client import DEFAULT_RETRIES, JevError, ask
     from judge import judge as self_judge
-    from questions import JUDGE_QUESTIONS, build_rank_question, build_state
+    from questions import (build_rank_question, build_state,
+                           judge_questions, knowledge_parts)
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
 
@@ -63,12 +65,14 @@ def _no_judge(candidates: list, reply_to, engine: str) -> dict:
 
 
 def _judge_via_openrouter(messages, relationship, context, candidates, reply_to, timeout,
-                          judge_base_url, judge_model, retries) -> dict:
-    """完整模式：走 OpenRouter 的 decisions 协议。返回 {answers, ranking, scores, best_index}。"""
-    questions = dict(JUDGE_QUESTIONS)
-    if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
-        questions.update(build_rank_question(candidates))
-    result = ask(build_state(messages, relationship, keep=context, reply_to=reply_to),
+                          judge_base_url, judge_model, retries, questions,
+                          background="", history=None) -> dict:
+    """完整模式：走 OpenRouter 的 decisions 协议。返回 {answers, ranking, scores, best_index}。
+
+    questions 由调用方拼好（它要按「这次有没有带知识库」决定要不要追加 BACKGROUND_NOTE）。
+    """
+    result = ask(build_state(messages, relationship, keep=context, reply_to=reply_to,
+                             background=background, history=history),
                  questions, timeout=timeout, base_url=judge_base_url, model=judge_model,
                  retries=retries)
 
@@ -98,7 +102,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             judge_model: str = "", judge: bool = True,
             retries: int = DEFAULT_RETRIES, judge_engine: str = "openrouter",
             judge_key: str = "", judge_timeout: float | None = None,
-            on_phase=None, candidate_count: int = 3) -> dict:
+            on_phase=None, candidate_count: int = 3, knowledge=None) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -121,6 +125,10 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     回调抛异常会被吞掉——进度没显示出来，不该让生成失败。
     candidate_count: 起草要几条候选，1~3，默认 3。只要 1 条时模型输出短、不用在多个版本间权衡，
     生成时间会短一截——这是「我想更快」最直接的一个口子。脏值当 3（见 draft_candidates）。
+    knowledge: 知识库注入（关系备注 / 命中的笔记 / 更早的历史），形状见 questions.knowledge_parts。
+    **默认 None = 行为完全不变**：不传时 state 里既没有 background 也没有 history，
+    每道题的 instructions 也不追加 BACKGROUND_NOTE，请求体跟加这个功能之前逐字节一致。
+    带上之后：判断和起草都会看到它，判断题会多一句「background 是给定上下文、不是跑题」。
     **判断失败不会连候选一起丢掉**：起草已经花钱拿到了 3 条能用的回复，因为第二步出问题就全扔，
     用户什么都得不到。这时如实返回 judged=False + judge_error（带状态码和提示），候选照常给。
 
@@ -134,7 +142,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     candidates = draft_candidates(messages, relationship, provider=provider,
                                   model=model, timeout=timeout, keep=context, reply_to=reply_to,
                                   style=style, thinking=thinking, base_url=draft_base_url,
-                                  retries=retries, count=candidate_count)
+                                  retries=retries, count=candidate_count, knowledge=knowledge)
 
     engine = judge_engine if judge else "none"
     if engine not in ("openrouter", "self"):
@@ -144,23 +152,44 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 
     j_timeout = timeout if judge_timeout is None else judge_timeout
     judge_keep = min(context, _JUDGE_CONTEXT_CAP)  # 判断不需要看那么远，见 _JUDGE_CONTEXT_CAP
-    if engine != "none":
-        _phase(on_phase, "judge")  # 起草成功之后、判断之前——两档判断都从这儿开始
-    try:
+    if engine == "none":
+        return _no_judge(candidates, reply_to, engine)
+    background, history = knowledge_parts(knowledge)
+    enriched = bool(background or history)   # 这次到底有没有东西可注入
+    questions = judge_questions(enriched)
+    if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
+        questions.update(build_rank_question(candidates, with_background=enriched))
+
+    def _judge(bg, hist):
+        """跑一次判断。bg/hist 为空 = 不带知识库字段那一版（脱掉重试时用）。"""
         if engine == "self":
-            got = self_judge(build_state(messages, relationship, keep=judge_keep, reply_to=reply_to),
-                             JUDGE_QUESTIONS, candidates,
-                             provider=provider, draft_base_url=draft_base_url,
-                             draft_model=model or "", base_url=judge_base_url,
-                             model=judge_model, key=judge_key, timeout=j_timeout, retries=retries)
+            return self_judge(build_state(messages, relationship, keep=judge_keep,
+                                          reply_to=reply_to, background=bg, history=hist),
+                              questions, candidates,
+                              provider=provider, draft_base_url=draft_base_url,
+                              draft_model=model or "", base_url=judge_base_url,
+                              model=judge_model, key=judge_key, timeout=j_timeout,
+                              retries=retries)
+        return _judge_via_openrouter(messages, relationship, judge_keep, candidates, reply_to,
+                                     j_timeout, judge_base_url, judge_model, retries, questions,
+                                     background=bg, history=hist)
+
+    _phase(on_phase, "judge")  # 起草成功之后、判断之前——两档判断都从这儿开始
+    try:
+        try:
+            got = _judge(background, history)
+        except JevError as e:
+            # 防御性重试：background / history 这两个新 state 字段，**对端到底认不认没有验证过**。
+            # 如果带着它们被 4xx 拒了，就脱掉再发一次——一个没验证过的字段可以削弱这次分析，
+            # 但绝不能让整次分析挂掉。（questions 不跟着变：上游也是只换 state，
+            # 一次只动一个变量，才判断得出到底是不是那两个字段的问题。）
+            if not (enriched and e.status is not None and 400 <= e.status <= 499):
+                raise
+            got = _judge("", [])
+        if engine == "self":
             got["scores"] = [None] * len(candidates)  # 自判不给概率：模型自评的百分比是编的
             got["best_index"] = got["ranking"][0]
             got["usage"] = {}
-        elif engine == "openrouter":
-            got = _judge_via_openrouter(messages, relationship, judge_keep, candidates, reply_to,
-                                        j_timeout, judge_base_url, judge_model, retries)
-        else:
-            return _no_judge(candidates, reply_to, engine)
     except JevError as e:
         # 判断失败，但候选保住了。judge_error 三件套跟起草失败那条路一个形状，
         # 状态栏可以复用同一套 error_status 文案。

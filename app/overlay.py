@@ -17,6 +17,8 @@ from qfluentwidgets import (
 )
 
 from app import settings
+from app.kb import selfcheck as kb_selfcheck
+from app.kb import ui as kb_ui
 from app.version import VERSION
 from core.draft import CHAT_PATH
 from core.jev_client import DECISIONS_PATH, normalize_endpoint
@@ -24,6 +26,7 @@ from core.jev_client import DECISIONS_PATH, normalize_endpoint
 _LOG_LINES = 300
 _MUTED = "#68776f"
 _GREEN = "#18794e"
+_RED = "#b44832"
 # 下拉框除了文字还要占的内边距 + 箭头宽度。minimumSizeHint 是「文字宽 + 这一圈」，
 # 直接拿可用宽度去省略，结果会比可用宽度多出这几十像素，照样把页面撑出窗口。
 _COMBO_CHROME = 48
@@ -338,14 +341,20 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_auto_send=None, on_settings_change=None, on_toggle_judge=None):
+                 on_auto_send=None, on_settings_change=None, on_toggle_judge=None,
+                 kb=None, on_kb_change=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_auto_send(文本) → 倒计时走完、该按发送键了。**界面只负责倒计时和取消**，
         真正发不发由 main 在那一下重新确认（输入框空不空、会话有没有被切走）——两处都过了才发。
         on_settings_change() → 设置存下来了。main 用它同步子进程要不要盯输入框（见 sync_watch_input）。
         on_toggle_judge(要不要判断) → 标题栏那个「判断」开关被拨动了。**由 main 负责存**，
-        界面不直接写配置文件——开关的持久化只有一条路，省得以后两处写法不一致。"""
+        界面不直接写配置文件——开关的持久化只有一条路，省得以后两处写法不一致。
+        kb → KbStore。**不给就不出现任何知识库控件**（设置页那一整块、首页那行计数、
+        「存为联系人」按钮全都藏起来），行为跟加这个功能之前一模一样——几个离线工具
+        构造 Overlay 时就是这么用的。
+        on_kb_change() → 知识库内容变了（新建/编辑/删除/清空/一键存联系人）。main 用它刷新计数。
+        """
         self.app = QApplication.instance() or QApplication([])
         setTheme(Theme.LIGHT)
         setThemeColor(_GREEN, save=False)
@@ -356,6 +365,9 @@ class Overlay:
         self.on_auto_send = on_auto_send
         self.on_settings_change = on_settings_change
         self.on_toggle_judge = on_toggle_judge
+        self.kb = kb
+        self.on_kb_change = on_kb_change
+        self.kbWindow = None   # 懒建：用户不点「知识库与联系人」就不构造那个窗口
         self.cands = []
         self.cards = []
         self._busy = False
@@ -597,6 +609,13 @@ class Overlay:
         body.addWidget(self.targetRow)
         self.status = _label("", 12, _MUTED)
         body.addWidget(self.status)
+        # 「这一轮到底带了什么」——知识库命中几条笔记、带了几条历史。用户开了知识库之后，
+        # 唯一能当场确认「它真的用上了」的地方就是这一行；两条都是 0 时写「未用知识库」，
+        # 免得让人以为带了东西其实没有。没有知识库（kb=None）时整行不出现。
+        self.kbLine = _label("", 11, _MUTED)
+        body.addWidget(self.kbLine)
+        if self.kb is None:
+            self.kbLine.hide()
         self.progress = IndeterminateProgressBar()
         self.progress.setFixedHeight(3)
         self.progress.hide()
@@ -693,6 +712,16 @@ class Overlay:
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
         body.addWidget(self.historyButton)
+        # 上游是「长按悬浮球 → 把当前会话存为联系人」。桌面端没有长按，做成一键按钮，
+        # 放在「聊天记录」旁边——同一类「当前会话」的动作。
+        self.saveContactButton = PushButton(FIF.PEOPLE, "存为联系人")
+        self.saveContactButton.setAccessibleName("把当前会话存为知识库联系人")
+        self.saveContactButton.setToolTip(
+            "把这个会话存成联系人，之后就能给它填关系、备注和别名")
+        self.saveContactButton.clicked.connect(self._save_contact)
+        body.addWidget(self.saveContactButton)
+        if self.kb is None:
+            self.saveContactButton.hide()
         self.feed = PlainTextEdit()
         self.feed.setReadOnly(True)
         self.feed.setPlaceholderText("识别到的聊天内容会显示在这里")
@@ -793,6 +822,62 @@ class Overlay:
             "从微信里那行时间戳认出来的，所以补录的旧消息会归到它真实的那一天。"
             "只在本机写文件，不联网。关掉开关时会把已经攒下的那批先写完，不会丢。"))
         body.addWidget(preference)
+
+        # ── 知识库（可选的一整块）─────────────────────────────────────────────
+        # 没有 store（几个离线工具构造 Overlay 时不传 kb）就整张卡都不出现，
+        # 设置页跟加这个功能之前完全一样。
+        self.kbCard = _Surface()
+        kbox = QVBoxLayout(self.kbCard)
+        kbox.setContentsMargins(16, 16, 16, 18)
+        kbox.setSpacing(12)
+        kbox.addWidget(_label("知识库", 16, "#304c3c", True))
+        kbox.addWidget(_label(
+            "只存在本机，不上传。写下的笔记和联系人会在分析时按会话标题与关键词带上。", 12, _MUTED))
+        kb_hist_row = QHBoxLayout()
+        kb_hist_row.addWidget(_label("记录聊天历史（只存本机）", 13), 1)
+        self.kbHistorySwitch = SwitchButton()
+        self.kbHistorySwitch.setOnText("开")
+        self.kbHistorySwitch.setOffText("关")
+        self.kbHistorySwitch.setAccessibleName("记录聊天历史到知识库")
+        kb_hist_row.addWidget(self.kbHistorySwitch)
+        kbox.addLayout(kb_hist_row)
+        self.kbHistHint = _label("", 12, _MUTED)
+        kbox.addWidget(self.kbHistHint)
+        kb_count_label = _label("注入最近历史条数（0–100）", 13)
+        kbox.addWidget(kb_count_label)
+        self.kbCountBox = SpinBox()
+        self.kbCountBox.setRange(0, 100)
+        self.kbCountBox.setAccessibleName("注入最近历史条数")
+        kb_count_label.setBuddy(self.kbCountBox)
+        kbox.addWidget(self.kbCountBox)
+        # 「记录历史开着、条数却是 0」这种组合必须当场说：两个控件各自看都正常，
+        # 凑一起才「只记录、永不注入」，用户自己发现不了。改动即刷新提示。
+        self.kbHistorySwitch.checkedChanged.connect(self._kb_hint)
+        self.kbCountBox.valueChanged.connect(self._kb_hint)
+        kb_actions = QHBoxLayout()
+        kb_actions.setSpacing(8)
+        self.kbOpenButton = PushButton(FIF.LIBRARY, "知识库与联系人")
+        self.kbOpenButton.setAccessibleName("打开知识库与联系人管理")
+        self.kbOpenButton.clicked.connect(self._open_kb)
+        kb_actions.addWidget(self.kbOpenButton)
+        self.kbClearButton = PushButton("清空知识库与历史")
+        self.kbClearButton.setAccessibleName("清空知识库与历史")
+        self.kbClearButton.clicked.connect(self._clear_kb)
+        kb_actions.addWidget(self.kbClearButton)
+        kb_actions.addStretch(1)
+        kbox.addLayout(kb_actions)
+        # 自检：刻意做得低调，它是排查用的开发辅助，不是用户功能（上游也是这个态度）。
+        self.kbCheckButton = PushButton("自检")
+        self.kbCheckButton.setAccessibleName("运行知识库自检")
+        self.kbCheckButton.setToolTip("用临时数据跑一遍匹配、命中和去重，跑完把自己造的东西删掉")
+        self.kbCheckButton.clicked.connect(self._selfcheck_kb)
+        kbox.addWidget(self.kbCheckButton, 0, Qt.AlignLeft)
+        self.kbResult = _label("", 12, _MUTED)
+        kbox.addWidget(self.kbResult)
+        self.kbResult.hide()  # 没跑过自检就别留一段空行（空标签仍占布局间距）
+        body.addWidget(self.kbCard)
+        if self.kb is None:
+            self.kbCard.hide()
 
         connection = _Surface()
         box = QVBoxLayout(connection)
@@ -1371,6 +1456,10 @@ class Overlay:
         # 存的是 send_key() 归一后的值（脏值已经退回 enter），所以这里两档一定对得上
         self.sendKeyBox.setCurrentIndex(0 if settings.send_key() == "enter" else 1)
         self.myNameEdit.setText(settings.my_name())
+        # 知识库那两格。kb=None 时整张卡藏着，控件照样填——不然将来谁把那块露出来会看到空格子。
+        self.kbHistorySwitch.setChecked(settings.kb_history_enabled())
+        self.kbCountBox.setValue(settings.kb_history_count())
+        self._kb_hint()
         self._sync_ds_fields()  # setCurrentIndex 没变就不发信号，这里补一次
         self._sync_auto_fields()
         self._sync_footer()
@@ -1444,7 +1533,9 @@ class Overlay:
                           my_name_text=self.myNameEdit.text().strip(),
                           draft_timeout_n=self.draftTimeoutBox.value(),
                           judge_timeout_n=self.judgeTimeoutBox.value(),
-                          candidate_count_n=self.candidateBox.value())
+                          candidate_count_n=self.candidateBox.value(),
+                          kb_history_enabled_on=self.kbHistorySwitch.isChecked(),
+                          kb_history_count_n=self.kbCountBox.value())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
@@ -1478,6 +1569,114 @@ class Overlay:
         if not self.cands and not self._busy:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
+
+    # ── 知识库 ──────────────────────────────────────────────────────────────
+    # kb=None（几个离线工具构造 Overlay 时不传）时这些入口都不会被调到——按钮和整张卡
+    # 都已经藏起来了。但每个入口仍先判一次，免得以后谁接错线时炸在更奇怪的地方。
+
+    def _kb_hint(self):
+        """设置页知识库那块下面那行说明。跨字段的组合要在这里点破：
+        「记录历史」开着但条数是 0 = 只往磁盘记、一条都不注入，用户看着两个控件都正常。"""
+        if self.kb is None:
+            return
+        if not self.kbHistorySwitch.isChecked():
+            self.kbHistHint.setText("关着：手写的笔记和联系人照常生效，只是不带聊天历史。")
+            self.kbHistHint.show()
+        elif self.kbCountBox.value() == 0:
+            self.kbHistHint.setText("条数为 0：历史只记录到本机、不会注入到分析里。")
+            self.kbHistHint.show()
+        else:
+            self.kbHistHint.hide()
+
+    def _open_kb(self):
+        """打开知识库窗口。懒建——用户不点就不构造那个顶层窗口。"""
+        if self.kb is None:
+            return
+        if self.kbWindow is None:
+            self.kbWindow = kb_ui.KnowledgeWindow(self.kb, on_change=self._kb_changed)
+        self.kbWindow.show_and_raise()
+
+    def _kb_changed(self):
+        """知识库里动过东西（新建/编辑/删除/清空/一键存联系人）。
+        通知 main 刷新计数那行；顺手把窗口里的列表也重建一次。"""
+        if self.kbWindow is not None:
+            try:
+                self.kbWindow.refresh()
+            except Exception:  # noqa: BLE001 —— 刷新失败不该让「已经存好了」看起来失败
+                pass
+        if self.on_kb_change:
+            try:
+                self.on_kb_change()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _clear_kb(self):
+        if self.kb is None:
+            return
+        counts = self.kb.counts()
+        if counts.notes == 0 and counts.contacts == 0:
+            kb_ui.toast(self, "知识库本来就是空的")
+            return
+        if not kb_ui.confirm(
+                self.win, "清空知识库",
+                f"删掉全部 {counts.notes} 条笔记、{counts.contacts} 个联系人"
+                f"（含 {counts.log_lines} 条历史）？不可恢复。密钥和设置不受影响。",
+                "清空", danger=True):
+            return
+        self.kb.clear_all()
+        # 窗口是建在这个 store 上的，clear_all 之后它可能还挂着已经删掉的条目。
+        # 直接销毁、下次点开重建，比逐个列表去对账可靠。
+        if self.kbWindow is not None:
+            self.kbWindow.close()
+            self.kbWindow.deleteLater()
+            self.kbWindow = None
+        self.kbResult.setText("")
+        self._kb_changed()
+        kb_ui.toast(self, "知识库已清空")
+
+    def _selfcheck_kb(self):
+        """跑一遍知识库自检（临时数据，跑完自删），把结果写在那行小字上。"""
+        if self.kb is None:
+            return
+        try:
+            text = kb_selfcheck.run(self.kb)
+        except Exception as e:  # noqa: BLE001 —— 自检自己都不该炸出去
+            text = f"自检异常：{type(e).__name__} {e}"
+        ok = text.startswith("自检通过")
+        qss = f"BodyLabel {{ color: {_GREEN if ok else _RED}; background: transparent; }}"
+        setCustomStyleSheet(self.kbResult, qss, qss)
+        self.kbResult.setText(text)
+        self.kbResult.show()
+        self._kb_changed()  # 自检会删掉自己造的数据，计数仍值得刷一次
+
+    def _save_contact(self):
+        """把界面上正在看的会话存成知识库联系人（上游是长按悬浮球）。"""
+        if self.kb is None:
+            return
+        title = self.current_chat()
+        if not title:
+            self.set_status("还没识别到会话，先把微信切到要存的那个聊天再试。", "warning")
+            return
+        try:
+            message = self.kb.save_or_merge_contact(title, "wechat")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[存联系人失败] {type(e).__name__}: {e}")
+            kb_ui.toast(self, "存联系人失败，详见聊天记录")
+            return
+        self._kb_changed()
+        kb_ui.toast(self, message)
+        self.set_status(message + "，可在设置 → 知识库与联系人里补关系和备注。", "success")
+
+    def set_context_info(self, notes, history):
+        """这一轮到底带了什么：命中几条笔记、注入几条历史。main 在每次分析前调一次。
+        两条都是 0 时明确写「未使用」，免得用户以为带了东西其实没有。"""
+        if self.kb is None:
+            return
+        if not notes and not history:
+            self.kbLine.setText("本轮未使用知识库")
+        else:
+            self.kbLine.setText(f"本轮已带上：{notes} 条笔记、{history} 条历史")
+        self.kbLine.show()
 
     def _settings_feedback(self, text, error=False):
         color = "#b44832" if error else _GREEN
