@@ -114,7 +114,9 @@ app/                    UI + 采集层
                         不显示百分比、标签用「候选 N」；set_failed() 是失败收尾（恢复候选可点 + 展开日志面板）
                         自动发送的界面也在这里：begin_auto()/_auto_tick()/_cancel_auto() 是倒计时条，
                         _sync_auto_fields() 管两个开关的显隐联动，_sync_footer() 让页脚的承诺跟着开关变
-  settings.py           四个 key 只进注册表，其余设置（含自定义地址/模型名/重试次数/判断引擎/自动发送/
+  settings.py           四个 key 只进注册表，且**存的是 DPAPI 密文**（CryptProtectData，只有同一个
+                        Windows 用户能解开；无前缀的旧值按明文读，兼容升级上来的老配置；
+                        解不开返回空串而不是把密文当密钥发出去）；其余设置（含自定义地址/模型名/重试次数/判断引擎/自动发送/
                         两个超时/候选条数）落 config.json；draft_problem()/draft_ready() 是「起草能不能跑」
                         的唯一口径，main 和界面共用；judge_engine() 是「判断实际会走哪一档」的唯一口径
                         （含运行时降级），stored_judge_engine() 是「用户选了什么」——降级不写回文件，
@@ -124,7 +126,11 @@ app/                    UI + 采集层
                         candidate_count()/auto_send_on()/auto_send_delay()/send_key()/my_name()/
                         draft_timeout()/judge_timeout() 同样是各自那格设置的唯一口径（夹取 + 脏值退默认）；
                         save_history()/history_dir() 是聊天记录导出的开关和落盘位置（程序目录下，
-                        不用 os.getcwd()——双击 exe 时那个可能是桌面）
+                        不用 os.getcwd()——双击 exe 时那个可能是桌面）；
+                        config.json 走**原子写**（_write_config：临时文件 + fsync + os.replace），
+                        坏文件不会被无声覆盖（保存前备份成 config.json.bad-<时间戳>），
+                        读取失败仍退默认值但会记一条告警由 main.tick() 报给用户
+                        （take_config_problem）——静默退回默认等于用户设置凭空消失
   recorder.py           聊天记录导出（**不依赖 Qt、不联网**）：按「会话名/日期.csv」分层落盘，
                         四列 时间/方向/发送者/内容；最近 50 条内查重（含模糊匹配，OCR 抖动算同一条），
                         跨运行读回最近 2 个 CSV 的尾部接着查（子进程重启整屏重报只有这层挡得住）；
@@ -147,10 +153,11 @@ core/                   Jev 判断内核，平台无关，跟安卓原版同一�
                         _content() 把响应体形状错误转成带 hint 的 JevError，不让 KeyError 逃出去
 tools/
   demo.py               端到端冒烟：拿一段写死的对话跑完整链（需 key + 联网）
-  跑全部离线检查（7 份，全部通过才 exit 0）：
-    for f in check_auto_send check_draft_mode check_recorder check_retry check_self_judge \
-             check_ui_layout check_overlay_runtime; do
-      python tools/$f.py || echo "FAIL $f"; done
+  跑全部离线检查（发现式：tools/check_*.py 全跑，新增脚本不用改清单；
+  check_release_bundle.py 要读 dist/ 产物，单独跑）：
+    for f in tools/check_*.py; do
+      case "$f" in */check_release_bundle.py) continue ;; esac
+      python "$f" || echo "FAIL $f"; done
     Qt 那两份需要 QT_QPA_PLATFORM=offscreen（无显示器时）。
   preview_ui.py         用合成数据预览界面，不采集不联网不碰微信；--screenshot 出图，
                         --judge-engine / --judge-error / --scroll-bottom 能把三档和判断失败那一种界面都截出来，
@@ -187,6 +194,13 @@ tools/
                         定时与批量 flush、main.drain() 的分叉、main.sync_history() 的建/收与收尾提示、
                         settings 开关的默认值与落盘。
                         全部写在临时目录里，跑完删掉，**绝不碰真实配置和真实聊天记录**；不需要 Qt、不联网
+  check_config.py       配置持久化离线回归：原子写（临时文件 + fsync + os.replace，不留 .tmp、
+                        陈旧 .tmp 会被顶掉、非 ASCII 不乱码）、坏文件在下次保存前被备份成
+                        config.json.bad-<时间戳> 且内容原样保留（好文件不备份）、
+                        坏配置仍退默认值但**必须报出来且只报一次**（首次运行不报）、
+                        密钥 DPAPI 密文往返（密文里不含明文、历史明文照读、解不开退空串、
+                        DPAPI 不可用时退回明文不丢 key）。
+                        **绝不碰真实配置与注册表**；不需要 Qt、不联网
 probe/                  一次性探针，结论已写进本文，留着是为了可复现
   probe_win.py          UIA 能不能读微信聊天文字 → 证伪（树是空的）
   probe_win2.py         UIA 证伪 v2：分清「树是空的」和「有树没文字」，顺带试 LegacyIAccessible

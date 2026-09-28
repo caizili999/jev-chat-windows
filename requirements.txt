@@ -3,7 +3,7 @@ rapidocr-onnxruntime>=1.4,<2  # offline Chinese OCR; 1.2.x rejects det_limit_* c
 numpy                         # frames are numpy arrays; chat-area detection is all numpy
 windows-capture               # Windows Graphics Capture, captures GPU-composited windows
 PySide6-Fluent-Widgets        # overlay UI (pulls in PySide6)
-pillow                        # only for the synthetic images in probe/
+pillow                        # runtime dep: rapidocr reads images through PIL (jev.spec:47 excludes everything but PIL)
 
 # optional, only for the two old UIA probes (already disproved; install to reproduce)
 # uiautomation                # probe_win.py / probe_win2.py

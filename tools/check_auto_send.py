@@ -198,6 +198,14 @@ def _tmp_config(initial: dict) -> str:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(initial, f, ensure_ascii=False)
     settings._CONFIG = path
+    # **密钥也必须 stub 掉，光隔离 config.json 不够。**
+    # settings._get_key() 是「先读进程环境，再读注册表 HKCU\Environment」，所以作者本机一旦
+    # 配过 OpenRouter 密钥，has_key() 就是 True，judge_engine() 跟着变成 "openrouter"——
+    # 而下面有一处断言它必须是 "none"（这个测试配置本来就没配起草服务）。
+    # 后果是：**这个脚本在开发机上必挂，只有干净的 CI runner 能过**。本地跑不过的测试会被
+    # 当成噪音，久而久之没人跑它——那比没有测试更糟。
+    # check_draft_mode / check_overlay_runtime 都做了这一步，这里原来漏了。
+    settings._get_key = lambda name: ""
     return path
 
 

@@ -296,7 +296,7 @@ PyCharm / VS Code 里直接 Run `main.py` 也行。
 | 群里不@我时先安静几秒 | 只对「不@我也回」生效，`0~30`，默认 **8**；填 0 = 不等 | `config.json` → `auto_send_any_wait` |
 | 按哪个键发送 | Enter（微信默认）/ Ctrl+Enter。**必须跟你微信「设置 → 通用 → 快捷键」里的选择一致** | `config.json` → `send_key` |
 | 我在群里的昵称 | 判断「有没有 @我」用的名字，要填群里显示的那个 | `config.json` → `my_name` |
-| API 密钥 | 四个 key 都**只进注册表** `HKCU\Environment`，任何文件里都不出现，也绝不进日志 | 注册表 → `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `CUSTOM_API_KEY` / `JUDGE_API_KEY` |
+| API 密钥 | 四个 key 都**只进注册表** `HKCU\Environment`，任何文件里都不出现，也绝不进日志；注册表里存的是 **DPAPI 密文**（只有同一个 Windows 用户能解开） | 注册表 → `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `CUSTOM_API_KEY` / `JUDGE_API_KEY` |
 
 保存时只校验格式（地址要 `http://` / `https://` 开头），**不拦「还没填 key」**——不然刚填的地址和模型会一起丢掉。
 缺什么由保存后那条提示统一说。
@@ -393,8 +393,12 @@ PyCharm / VS Code 里直接 Run `main.py` 也行。
 - **不碰钱。** 转账、红包、收款相关的界面元素一律不碰，起草的 system prompt 里也禁了这几个话题。
 - **只有对方的新消息到来（或你在群里换了回复对象）才调一次模型。** 静默期零调用——十分钟没人说话
   就是十分钟零 token。
-- **API key 只进环境变量。** 四个 key 都写进注册表 `HKCU\Environment`（跟 `setx` 同一个地方），
-  任何文件里都不出现 key，也绝不进日志（报错文本一律脱敏）。
+- **API key 只进环境变量，且注册表里是密文。** 四个 key 都写进注册表 `HKCU\Environment`
+  （跟 `setx` 同一个地方），任何文件里都不出现 key，也绝不进日志（报错文本一律脱敏）。
+  注册表里存的值是 **Windows DPAPI 加密后的密文**（`CryptProtectData`），只能被**同一个
+  Windows 用户**解开——注册表快照、备份、截图、别的账户都读不出明文。诚实说清边界：
+  它挡的是「密钥以明文躺在那里被顺手拿走」，挡不住「已经以你的身份在运行的恶意程序」
+  （那种情况下它本来也能读注册表）。进程内存里仍然是明文，因为 `core/` 那层只认环境变量。
 - **自定义地址会改变出网范围。** 地址本身不是密钥，落在 `config.json`；但填了它，对话文本就发到那里。
   两个地址都留空时，出网范围跟以前完全一样。
 - **启动时查一次版本号（可关）。** 只向 GitHub Releases API 发一个 GET，带的只有 UA 和当前版本号，
@@ -492,9 +496,11 @@ python tools/check_release_bundle.py --expect-version 1.2.3   # 顺带断言版�
 - `tools/` 里有一批**离线回归检查**（不需要 Qt、不联网、不碰真实微信），跑全部：
 
   ```bash
-  for f in check_auto_send check_draft_mode check_recorder check_retry check_self_judge \
-           check_ui_layout check_overlay_runtime; do
-    QT_QPA_PLATFORM=offscreen python tools/$f.py || echo "FAIL $f"; done
+  # 发现式：tools/check_*.py 全部跑一遍。新增检查脚本不用改任何清单。
+  # check_release_bundle.py 要读 dist/ 构建产物，单独跑（见下）。
+  for f in tools/check_*.py; do
+    case "$f" in */check_release_bundle.py) continue ;; esac
+    QT_QPA_PLATFORM=offscreen python "$f" || echo "FAIL $f"; done
   ```
 
   其中 `check_ui_layout` / `check_overlay_runtime` 需要 PySide6，其余不需要。

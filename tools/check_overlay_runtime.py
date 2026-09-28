@@ -324,10 +324,21 @@ def check_judge_toggle(ov) -> None:
     """
     seen = []
     ov.on_toggle_judge = lambda on: seen.append(on)
+
+    # 这里原来是一句 `assert ov.judgeSwitch.isChecked() is False or True` —— 恒真，等于没测。
+    # 真正要守的是「_judge_toggled 自己不碰开关状态」：它是 checkedChanged 的槽，用户拨动时
+    # Qt 已经把状态设好了；槽里再改一次就是跟 Qt 打架，那正是这个开关回环的另一半。
+    # 直接调用槽（不经过信号）时，开关状态必须原封不动。
+    state_before = ov.judgeSwitch.isChecked()
+    ov._judge_toggled(True)
+    ov._judge_toggled(False)
+    assert ov.judgeSwitch.isChecked() is state_before, \
+        "_judge_toggled 不该自己改开关状态——那是 Qt 的活，改了就成回环"
+
+    seen.clear()  # 上面那两次只为验「状态不被改动」，跟下面这组回调断言分开算
     ov._judge_toggled(True)
     ov._judge_toggled(False)
     assert seen == [True, False], f"拨动回调次数/值不对：{seen}"
-    assert ov.judgeSwitch.isChecked() is False or True  # 开关自身状态由 Qt 维护，这里只确认没炸
 
     before = list(seen)
     ov.set_judge(True)
@@ -369,6 +380,41 @@ def check_group_name_warning(ov) -> None:
     ov._back_home()
 
 
+def check_config_problem_reaches_ui(ov) -> None:
+    """config.json 坏掉时，告警必须**真的走到用户眼前**（状态栏 + 聊天记录面板）。
+
+    守的是「静默失效」：settings._cfg() 对坏文件退回默认值是刻意的 fail-safe 口径（不能改，
+    check_config.py 钉着它），但如果没人把这件事说出来，用户看到的就是「我的设置全没了」——
+    既不知道原因，也不知道下次保存会把那份可能还能救的文件覆盖掉。
+    main.tick() 是唯一把它捞出来的地方，所以这里测的是那条接线，不是 settings 本身。
+
+    为什么值得单独一条：这类「底层已经知道了，但没人告诉用户」的断线，是静态检查
+    （check_ui_layout 那类）和单元断言都抓不到的——只有把 main.tick() 真跑一遍才看得见。
+    """
+    import queue as _queue
+
+    import main as main_mod
+    from app import settings as st
+
+    # tick() 依赖这三个模块级全局（正常运行时由 main.py 的 __main__ 段建好）。
+    # 这里不还原：tick() 结尾会自己再排一次 50ms 后的回调，留着一个能用的环境比还原成
+    # None 更安全（还原了反而会让那个迟到的 tick 抛 NameError）。本脚本最后 os._exit(0)。
+    main_mod.q = _queue.Queue()
+    main_mod.ov = ov
+    main_mod.history_rec = None
+
+    st._config_noted.clear()
+    st._config_problems.clear()
+    st._config_problems.append("config.json 读不出来（这条是测试造出来的）")
+    ov.set_status("", "idle")
+    main_mod.tick()
+
+    assert "config.json" in ov.status.text(), f"告警没上状态栏：{ov.status.text()!r}"
+    assert "config.json" in ov.feed.toPlainText(), "详情该同时进聊天记录面板"
+    assert st.take_config_problem() == [], "tick() 取过之后该清空，否则每 50ms 报一次"
+    print("坏配置告警真的到了界面上 ok")
+
+
 if __name__ == "__main__":
     path = _tmp_config({"relationship": "朋友", "retries": 2})
     try:
@@ -389,6 +435,7 @@ if __name__ == "__main__":
         check_judge_toggle(ov)
         check_candidate_control(ov)
         check_group_name_warning(ov)
+        check_config_problem_reaches_ui(ov)
     finally:
         try:
             os.unlink(path)

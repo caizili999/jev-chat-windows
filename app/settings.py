@@ -1,15 +1,23 @@
 # -*- coding: utf-8 -*-
 """设置持久化。key 硬约束（docs/KICKOFF.md #6）：只进环境变量，绝不落文件；relationship 不是密钥，落 config.json。
 
-key 的持久化走 Windows 用户环境变量（注册表 HKCU\\Environment，跟 setx 写的是同一个地方）。
+key 的持久化走 Windows 用户环境变量（注册表 HKCU\\Environment，跟 setx 写的是同一个地方），
+**存进去的是 DPAPI 密文**——见下面 _protect_key。进程环境里放的仍是明文，因为 core/ 那层
+只认 os.environ，redact_secrets() 也靠它脱敏。
 读的时候先看进程环境，没有就直接读注册表——IDE 启动时把环境快照拿走了，之后再 Run 继承的还是旧环境，
-只靠 os.environ 会「保存了下次打开还是没有」。"""
+只靠 os.environ 会「保存了下次打开还是没有」。
+
+config.json 走**原子写**（_write_config）：直接覆盖写会在中途崩溃时留下半截 JSON，
+而坏 JSON 会让所有设置静默退回默认值——那正是「用户刚改完设置」这个最不该丢的时刻。
+坏文件也不会被无声覆盖，保存前会先备份成 config.json.bad-<时间戳>。"""
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
+from datetime import datetime
 
 from core.draft import CHAT_PATH
 from core.jev_client import normalize_endpoint
@@ -50,13 +58,100 @@ _MIN_CANDIDATES = 1
 _MAX_CANDIDATES = 3
 
 def _cfg() -> dict:
-    """每次都重新读文件，改设置不用重启进程。读不到/坏了/不是对象一律当空配置，退回默认值。"""
+    """每次都重新读文件，改设置不用重启进程。读不到/坏了/不是对象一律当空配置，退回默认值。
+
+    **但坏了必须说出来。** 以前这里对坏文件静默返回 {}，于是所有设置悄悄变回默认值——
+    关系背景、中转地址、模型名、自动发送三个开关、群昵称，一次性全丢，而用户看到的只是
+    「我的配置怎么没了」，没有任何解释；更糟的是他接着点一次「保存」，就会把那份
+    **可能还能手工救回来**的文件覆盖掉。
+    现在坏掉时记一条告警（见 take_config_problem，由 main.tick() 报给用户），
+    并且在下次保存前把坏文件备份成 config.json.bad-<时间戳>，不再无声销毁。
+
+    注意 FileNotFoundError 要单独放行：那是「还没建过配置」的正常首次运行路径，
+    不是故障，不能给新用户弹一条吓人的告警。
+    """
     try:
         with open(_CONFIG, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    except (OSError, ValueError) as e:
+        _note_config_problem(
+            f"config.json 读不出来（{type(e).__name__}），这次先按默认值运行；"
+            "原文件会保留，下次保存前自动备份成 config.json.bad-*")
+        return {}
+    if not isinstance(data, dict):
+        _note_config_problem("config.json 里不是 JSON 对象，这次先按默认值运行")
+        return {}
+    return data
+
+
+# ── 配置读取告警：坏文件不能再静默 ────────────────────────────────────────────
+# 跟 app/recorder.py 的 problems 一个套路：攒着，由上层（main.tick）取走报给用户。
+# 同一条只说一次——_cfg() 一次生成要调十几次，不封口就会刷屏。
+_config_problems: list = []
+_config_noted: set = set()
+
+
+def _note_config_problem(msg: str) -> None:
+    if msg in _config_noted:
+        return
+    _config_noted.add(msg)
+    _config_problems.append(msg)
+
+
+def take_config_problem() -> list:
+    """取走读配置时攒下的告警（取完清空）。main.tick() 拿去写日志和状态栏。"""
+    out, _config_problems[:] = list(_config_problems), []
+    return out
+
+
+def _backup_if_broken(folder: str) -> None:
+    """旧 config.json 存在但解析不了 → 改名成 config.json.bad-<时间戳> 留着。
+
+    只在保存前做这一次。坏文件里可能是用户唯一一份配置（手工修一下就能救回来），
+    不该被我们一次覆盖就永久消失。备份失败也不能拦着保存——那是两件事。
+    """
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            json.load(f)
+        return  # 能正常解析，不需要备份
+    except FileNotFoundError:
+        return
+    except Exception:  # noqa: BLE001 —— 读不动就是「坏」，往下走备份
+        pass
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = os.path.join(folder, f"{os.path.basename(_CONFIG)}.bad-{stamp}")
+    try:
+        os.replace(_CONFIG, target)
+    except OSError:
+        return
+    _note_config_problem(f"之前那个损坏的 config.json 已备份为 {os.path.basename(target)}")
+
+
+def _write_config(data: dict) -> None:
+    """原子写 config.json：写临时文件 → fsync → os.replace。
+
+    原来直接 `open(_CONFIG, "w")` 覆盖写。那样写到一半崩溃、断电、磁盘满，就会留下
+    半截 JSON；而 _cfg() 见到坏 JSON 就退回默认值——等于用户所有设置一次性全丢，
+    而且触发它的往往正是「用户刚改完设置」这个最不该丢的时刻。
+    os.replace 在同一分区上是原子的：外界看到的要么是完整旧文件、要么是完整新文件，
+    不存在中间态。fsync 是为了让数据真的落到盘上，而不只是进了系统缓存。
+
+    fsync 是**尽力而为**：个别文件系统（网络盘、某些容器卷）上它会直接报错，而那时
+    「设置保存失败」比「少一层落盘保障」严重得多——原子性来自 os.replace，不来自 fsync。
+    """
+    folder = os.path.dirname(_CONFIG) or "."
+    _backup_if_broken(folder)
+    tmp = os.path.join(folder, os.path.basename(_CONFIG) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, _CONFIG)
 
 def _text(name: str, default: str = "") -> str:
     """config.json 里的字符串项。"""
@@ -298,8 +393,106 @@ def my_name() -> str:
     而且每个群可以不同（本版只能填一个，填最常用的那个）。留空 = 群里不自动发送。"""
     return _text("my_name").strip()
 
+# ── 密钥的存储：注册表里存 DPAPI 密文，不是明文 ────────────────────────────────
+# 原来的做法是把 key 以明文 REG_SZ 写进 HKCU\Environment。那跟「把 key 写在文件里」没有实质
+# 区别——任何以本用户身份运行的程序（随便一个脚本、随便一个 IDE 插件）都能直接读走，
+# 而 docs/KICKOFF.md #6 立的规矩正是「key 不落明文」。现在改成 DPAPI 加密后再存：
+# 密文只能被**同一个 Windows 用户**解开，注册表快照、备份、截图、别的账户都读不出明文。
+#
+# 诚实说清它的边界：DPAPI 挡不住「已经以你的身份在跑的恶意程序」——那种情况下它本来也能
+# 读注册表。它挡的是「密钥以明文形式躺在那里被顺手拿走」这一类，这是收益最大的一档。
+_KEY_PREFIX = "dpapi:"  # 带这个前缀 = 我们加密存的；不带 = 历史遗留的明文，照读
+
+
+class _Blob(ctypes.Structure):
+    """Win32 的 DATA_BLOB。CryptProtectData / CryptUnprotectData 都吃它，
+    字段顺序和宽度必须跟 Windows 头文件一致，否则是内存踩踏而不是报错。"""
+    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.c_void_p)]
+
+
+def _dpapi_fn(name: str):
+    """取 crypt32 里的一个函数并声明签名；取不到（非 Windows）返回 None。
+
+    这两个函数是同一套签名（7 个参数、返回 BOOL），所以共用一份声明。
+    """
+    try:
+        fn = getattr(ctypes.windll.crypt32, name)
+    except (AttributeError, OSError):
+        return None
+    fn.argtypes = [ctypes.POINTER(_Blob), ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_Blob)]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _crypt(data: bytes, decrypt: bool) -> bytes | None:
+    """DPAPI 加密/解密一趟；任何一步不成就返回 None（调用方负责退回明文行为）。"""
+    fn = _dpapi_fn("CryptUnprotectData" if decrypt else "CryptProtectData")
+    if fn is None or not data:
+        return None
+    src_buf = ctypes.create_string_buffer(data, len(data))  # 必须活到调用结束
+    src = _Blob(len(data), ctypes.cast(src_buf, ctypes.c_void_p))
+    out = _Blob()
+    try:
+        ok = fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out))
+    except Exception:  # noqa: BLE001 —— DPAPI 不可用只该降级，不该让保存/读取炸掉
+        return None
+    if not ok or not out.pbData:
+        return None
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        try:
+            ctypes.windll.kernel32.LocalFree(out.pbData)  # DPAPI 分配的内存要还
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _protect_key(plain: str) -> str:
+    """明文 key → 写进注册表的字符串。
+
+    加密不可用时**原样返回明文**，退回历史行为：存储方式出问题绝不能让用户填的密钥直接消失，
+    那比明文存着严重得多（用户会以为程序坏了，还得重新去申请一个 key）。
+    """
+    if not plain:
+        return ""
+    blob = _crypt(plain.encode("utf-8"), decrypt=False)
+    if blob is None:
+        return plain
+    return _KEY_PREFIX + base64.b64encode(blob).decode("ascii")
+
+
+def _unprotect_key(raw: str) -> str:
+    """注册表/环境变量里的值 → 明文 key。
+
+    解不开时返回**空串**，而不是把密文原样当密钥发出去——那只会换回一个 401，比
+    「没填密钥」更难查。同时记一条告警说清原因（换过 Windows 账户、把配置搬到了别的机器）。
+    不带前缀的一律当历史遗留明文，老用户升级上来密钥还在，下次保存才转成加密。
+    """
+    if not raw:
+        return ""
+    if not raw.startswith(_KEY_PREFIX):
+        return raw
+    try:
+        blob = base64.b64decode(raw[len(_KEY_PREFIX):], validate=True)
+    except Exception:  # noqa: BLE001 —— 值被手改坏了
+        blob = None
+    plain = _crypt(blob, decrypt=True) if blob else None
+    if plain is None:
+        _note_config_problem(
+            "已保存的密钥解不开（换过 Windows 账户，或把配置搬到了别的机器），"
+            "请在设置页重新填一次")
+        return ""
+    return plain.decode("utf-8", errors="replace")
+
+
 def _get_key(env_name: str) -> str:
-    """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
+    """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。
+
+    两个来源都可能存着密文（注册表那份一定，进程环境那份在被广播过之后也是），
+    所以统一过一遍 _unprotect_key；解出来的明文再回填进 os.environ，
+    core/ 那层和 redact_secrets() 都只认明文。
+    """
     v = os.environ.get(env_name, "").strip()
     if not v:
         try:
@@ -309,19 +502,25 @@ def _get_key(env_name: str) -> str:
                 v = str(winreg.QueryValueEx(k, env_name)[0]).strip()
         except Exception:  # 非 Windows / 没这个值
             v = ""
-        if v:
-            os.environ[env_name] = v
+    v = _unprotect_key(v)
+    if v:
+        os.environ[env_name] = v
     return v
 
 def _set_key(env_name: str, value: str) -> None:
-    """只写进程环境 + HKCU\\Environment，不写任何文件。"""
+    """只写进程环境 + HKCU\\Environment，不写任何文件。
+
+    进程环境里放明文（core/ 只认 os.environ，redact_secrets 也靠它脱敏）；
+    注册表里放 DPAPI 密文（见 _protect_key）。
+    """
     os.environ[env_name] = value
     try:
         import winreg
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k, env_name, 0, winreg.REG_SZ, value)
-        # 广播一下，之后新开的终端/进程就能看到；已经开着的 IDE 看不到也无所谓，启动时会读注册表
+            winreg.SetValueEx(k, env_name, 0, winreg.REG_SZ, _protect_key(value))
+        # 广播一下，之后新开的终端/进程就能看到；已经开着的 IDE 看不到也无所谓，启动时会读注册表。
+        # 广播出去的是密文，所以这一步不再扩大明文暴露面。
         ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
     except Exception:
         pass  # 非 Windows（本机 Mac 开发）走不到，忽略
@@ -379,8 +578,7 @@ def save_judge_engine(engine: str) -> None:
     data = _cfg()
     data["judge_engine"] = engine
     try:
-        with open(_CONFIG, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+        _write_config(data)
     except OSError:
         pass  # 写不进去（文件只读之类）不该崩：开关看起来没生效，但程序照常能用
 
@@ -442,8 +640,9 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
     jto = judge_timeout() if judge_timeout_n is None else max(_MIN_TIMEOUT, min(_MAX_TIMEOUT, int(judge_timeout_n)))
     cnt = (candidate_count() if candidate_count_n is None
            else max(_MIN_CANDIDATES, min(_MAX_CANDIDATES, int(candidate_count_n))))
-    with open(_CONFIG, "w", encoding="utf-8") as f:
-        json.dump({"relationship": relationship_text, "context": n, "draft_provider": provider,
+    # 原子写：见 _write_config 的 docstring。用户改完设置点「保存」的这一刻，
+    # 正是最不该因为半截文件而把全部配置丢掉的时刻。
+    _write_config({"relationship": relationship_text, "context": n, "draft_provider": provider,
                    "reply_target": target, "style": style_v, "thinking": think,
                    "check_update": check, "save_history": hist,
                    "draft_base_url": draft_url, "draft_model": draft_m,
@@ -451,5 +650,4 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
                    "judge_engine": engine, "auto_send_dm": dm, "auto_send_group": grp,
                    "auto_send_group_any": any_on, "auto_send_any_wait": any_wait,
                    "auto_send_delay": delay, "send_key": skey, "my_name": myname,
-                   "draft_timeout": dto, "judge_timeout": jto, "candidate_count": cnt},
-                  f, ensure_ascii=False)
+                   "draft_timeout": dto, "judge_timeout": jto, "candidate_count": cnt})

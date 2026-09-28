@@ -79,16 +79,31 @@ jobs:
 
       # 离线回归：不联网、不碰真实微信、不碰真实 config（脚本自己把 settings._CONFIG 指到临时文件）。
       # 放在构建前跑：3 分钟就能拦下的问题，别等 6 分钟的打包跑完才发现。
+      # 发现式：tools/check_*.py 全部跑一遍，新增脚本不用改这里。
+      # 以前这里是硬编码的 7 个文件名（README 和 DESIGN 里又各抄了一份），
+      # 新增一个 check 只要漏改三处里的任何一处，CI 照样全绿——绿灯就成了假信号，
+      # 比没有测试更危险。现在唯一的「清单」就是文件名本身。
+      # check_release_bundle.py 要读 dist/ 构建产物，由下一步单独跑，这里排除。
       - name: Run offline regression checks
         env:
           QT_QPA_PLATFORM: offscreen  # 无头跑 Qt：不开真窗口，字体仍从系统加载
           PYTHONIOENCODING: utf-8  # runner 控制台是 cp1252，脚本 print 中文会 UnicodeEncodeError
         shell: bash
         run: |
-          for f in check_auto_send check_draft_mode check_recorder check_retry \
-                   check_self_judge check_ui_layout check_overlay_runtime; do
+          shopt -s nullglob
+          files=(tools/check_*.py)
+          # 下限自检：通配符写错、目录结构变了、脚本被误删，都会让循环「零次成功」，
+          # 那种情况必须报错而不是当作全过。
+          if [ "${#files[@]}" -lt 8 ]; then
+            echo "只发现 ${#files[@]} 个检查脚本（预期至少 8 个），通配符或目录结构是不是坏了？"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            case "$f" in
+              */check_release_bundle.py) continue ;;
+            esac
             echo "=== $f ==="
-            python "tools/$f.py" || exit 1
+            python "$f" || exit 1
           done
 
       - name: Build with PyInstaller
