@@ -179,12 +179,39 @@ def check_hint(ov) -> None:
 # ── 5. 首页那行「本轮带了什么」 ──────────────────────────────────────────────
 
 def check_context_line(ov) -> None:
+    # 什么都没识别到：老文案，不能变
     ov.set_context_info(0, 0)
     assert "未使用" in ov.kbLine.text(), f"0/0 时要明确说没用到：{ov.kbLine.text()!r}"
+
+    # 识别到联系人、但确实没东西可补 —— **不能说「未使用」**。
+    # 用户就是这么被误导的：他存了联系人、知识库里也有十几条记录，却看到「未使用」，
+    # 以为功能坏了；其实是那一屏的消息全在屏幕上、被去重剔干净了。
+    ov.set_context_info(0, 0, contact_matched=True)
+    text = ov.kbLine.text()
+    assert "未使用" not in text, f"联系人命中了就不该说没用到：{text!r}"
+    assert "联系人" in text, f"该告诉用户联系人已经认出来了：{text!r}"
+
+    # 只有联系人背景（关系/备注）被注入时，不能退化成「0 条笔记、0 条历史」
+    ov.set_context_info(0, 0, background="关系：同事\n关于KK：说话客气些")
+    text = ov.kbLine.text()
+    assert "未使用" not in text, f"背景发出去了就不能说没用到：{text!r}"
+    assert "背景" in text, f"该说清带上的是联系人背景：{text!r}"
+
+    # 纯空白 background 不算背景，别被它骗成「已带上」
+    ov.set_context_info(0, 0, background="   ")
+    assert "未使用" in ov.kbLine.text(), f"空白背景不算数：{ov.kbLine.text()!r}"
+
     ov.set_context_info(2, 5)
     text = ov.kbLine.text()
     assert "2" in text and "5" in text, f"两个数都要写出来：{text!r}"
     assert "笔记" in text and "历史" in text, f"得说清带的是什么：{text!r}"
+    assert "背景" not in text, f"没背景时别多嘴：{text!r}"
+
+    # 有笔记/历史、又有背景：三样都要在，且原来的两个数还在原位
+    ov.set_context_info(2, 5, background="关系：同事")
+    text = ov.kbLine.text()
+    assert "2" in text and "5" in text and "背景" in text, f"三样都该写出来：{text!r}"
+    assert text.startswith("本轮已带上：2 条笔记、5 条历史"), f"原有的两个数不能变形：{text!r}"
 
 
 # ── 6. 一键存联系人 ─────────────────────────────────────────────────────────
@@ -372,6 +399,22 @@ def check_main_wiring(ov, store, path: str) -> None:
         assert knowledge["history"][0] == {"from": "her", "text": "上周说好周五交稿"}, \
             f"history 的形状必须是 {{from, text}}（core 只认这个）：{knowledge['history']!r}"
         assert "1" in ov.kbLine.text(), f"首页那行该报带上了历史：{ov.kbLine.text()!r}"
+
+        # (c) 用户实际踩到的坑：联系人命中了、历史也开着，但**这一屏的消息全都还在屏幕上**，
+        #     去重（app/kb/context.py 的 on_screen）把它们剔干净 → 什么都不注入。
+        #     这时界面必须说「识别到了，但没有可补的内容」，**不能说「未使用知识库」**——
+        #     那会让人以为知识库根本没生效，而实际上联系人早认出来了、这一屏也记进去了。
+        store.clear_all()
+        store.save_contact(Contact(id="c10", name="测试群", apps=["wechat"]))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"relationship": "朋友", "kb_history_enabled": True,
+                       "kb_history_count": 30}, f, ensure_ascii=False)
+        knowledge = main_mod.build_knowledge("测试群", [("her", "在吗，这周末有空吗")])
+        assert knowledge == {"background": "", "history": []}, \
+            f"屏上已有的消息不重复注入，这一轮该是空的：{knowledge!r}"
+        text = ov.kbLine.text()
+        assert "未使用" not in text, f"联系人命中了就不该说没用到：{text!r}"
+        assert "联系人" in text, f"该告诉用户联系人已经认出来了：{text!r}"
     finally:
         main_mod.ov, main_mod.kb_store = real_ov, real_store
 

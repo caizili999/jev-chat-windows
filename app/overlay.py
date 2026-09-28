@@ -1670,15 +1670,35 @@ class Overlay:
         kb_ui.toast(self.win, message)
         self.set_status(message + "，可在设置 → 知识库与联系人里补关系和备注。", "success")
 
-    def set_context_info(self, notes, history):
-        """这一轮到底带了什么：命中几条笔记、注入几条历史。main 在每次分析前调一次。
-        两条都是 0 时明确写「未使用」，免得用户以为带了东西其实没有。"""
+    def set_context_info(self, notes, history, background="", contact_matched=False):
+        """这一轮到底带了什么：命中几条笔记、注入几条历史、有没有带上联系人背景。
+
+        main 在每次分析前调一次。**三种状态必须分开说**——把「没东西可补」说成
+        「没用知识库」是踩过的真坑：用户明明存了联系人、知识库里也躺着十几条记录，
+        看到「本轮未使用知识库」只会以为功能坏了，而实际上是那一屏的消息全都还在屏幕上
+        （去重会剔掉屏上已有的，见 app/kb/context.py），确实没有额外的可补。
+
+            什么都没识别到             → 本轮未使用知识库
+            识别到联系人但没有可补内容 → 本轮已识别到联系人，但没有可补的内容
+            有东西带上                 → 本轮已带上：N 条笔记、M 条历史[、联系人背景]
+
+        background 是联系人背景（关系 / 备注 / 过往摘要）。它**是真的发出去了**，
+        所以它非空时绝不能说「未使用」，哪怕笔记和历史都是 0。
+        """
         if self.kb is None:
             return
-        if not notes and not history:
-            self.kbLine.setText("本轮未使用知识库")
+        has_bg = bool(str(background or "").strip())
+        if notes or history:
+            text = f"本轮已带上：{notes} 条笔记、{history} 条历史"
+            if has_bg:
+                text += "、联系人背景"
+        elif has_bg:
+            text = "本轮已带上：联系人背景"
+        elif contact_matched:
+            text = "本轮已识别到联系人，但没有可补的内容"
         else:
-            self.kbLine.setText(f"本轮已带上：{notes} 条笔记、{history} 条历史")
+            text = "本轮未使用知识库"
+        self.kbLine.setText(text)
         self.kbLine.show()
 
     def _settings_feedback(self, text, error=False):

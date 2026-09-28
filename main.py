@@ -137,10 +137,15 @@ def build_knowledge(title, msgs):
     except Exception as e:  # noqa: BLE001
         ov.log(f"[知识库] 组装上下文失败：{type(e).__name__}: {e}")
         return None
-    # 界面上那行「本轮已带上 N 条笔记、M 条历史」——用户开了知识库之后，这是他唯一能当场
-    # 确认「真的用上了」的地方。0/0 时界面会明确写「本轮未使用知识库」。
-    ov.set_context_info(len(ctx.notes), len(ctx.history))
-    return as_knowledge(ctx)
+    # 界面上那行「本轮带了什么」——用户开了知识库之后，这是他唯一能当场确认「真的用上了」
+    # 的地方。除了两个条数，还要把「有没有带上联系人背景」和「联系人认没认出来」一起给它：
+    # 只说「未使用知识库」会把「没东西可补」说成「功能没生效」（见 Overlay.set_context_info）。
+    # background 直接复用马上要发出去的那份，不另算一遍。
+    knowledge = as_knowledge(ctx)
+    ov.set_context_info(len(ctx.notes), len(ctx.history),
+                        background=knowledge["background"],
+                        contact_matched=ctx.contact is not None)
+    return knowledge
 
 
 def analyze_bg(msgs, title, revision, reply_to=None, knowledge=None):

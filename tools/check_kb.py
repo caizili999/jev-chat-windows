@@ -195,6 +195,49 @@ def check_screen_batch_rules():
     print("一屏序列算法 ok（同屏不重写 / 增量追加 / 上翻不写 / 空白丢弃 / 手工注入）")
 
 
+def check_screen_batch_does_not_freeze():
+    """一次涌进来一整屏以上的新消息之后，日志**必须能恢复增长**。
+
+    真踩过的坑：`append_log` 里那条「跟上一屏毫无交集 ⇒ 用户往上翻了 ⇒ 不写」的启发式，
+    分不清「往上翻」和「一口气来了整整一屏新消息」——两种情况长得一模一样。这本来只是
+    少记一屏，但当时它**连「上一屏」标记都不更新**，标记就永远停在旧屏上，于是之后每一轮
+    都零交集、每一轮都跳过，日志从此再不增长。用户那边表现为「历史一直是 18 条」，
+    聊了 80 分钟一条没记，而配置里明明写着 30 条。
+    """
+    with _Tmp() as st:
+        # 先正常聊出一屏
+        st.append_log("c", _screen(*[("her", f"第{i}条") for i in range(10)]))
+        assert st.log_size("c") == 10
+
+        # 两次分析之间涌进来一整屏以上的新消息：屏上 10 行全新，跟上一屏零交集。
+        # 这一轮按上游的规则**就是**不写（分不清是不是往上翻），保留这个行为。
+        st.append_log("c", _screen(*[("her", f"新第{i}条") for i in range(10)]))
+        assert st.log_size("c") == 10, "零交集那一轮本来就该跳过，不该写"
+
+        # 关键断言：**不能就此卡死**。下一轮屏幕只是平滑前进一行，就该恢复追加。
+        st.append_log("c", _screen(*([("her", f"新第{i}条") for i in range(1, 10)]
+                                    + [("her", "又来一条")])))
+        assert st.log_size("c") > 10, \
+            f"大跳之后必须能恢复增长，实际还卡在 {st.log_size('c')} 条——日志永久冻结了"
+        assert [e.text for e in st.recent_log("c", 1)] == ["又来一条"]
+
+        # 再跟一轮，确认恢复之后是正常增量（只追加新出来的那条），不是每轮整屏重抄
+        n = st.log_size("c")
+        st.append_log("c", _screen(*([("her", f"新第{i}条") for i in range(2, 10)]
+                                    + [("her", "又来一条"), ("me", "再加一条")])))
+        assert st.log_size("c") == n + 1, \
+            f"恢复之后该只追加 1 条增量，实际 {st.log_size('c') - n} 条"
+
+        # 反复大跳也不能把它锁死：连着来三屏全新内容，每一屏之后再平滑一步都要能跟上
+        for r in range(3):
+            st.append_log("c", _screen(*[("her", f"第{r}轮全新{i}") for i in range(10)]))
+            m = st.log_size("c")
+            st.append_log("c", _screen(*([("her", f"第{r}轮全新{i}") for i in range(1, 10)]
+                                        + [("her", f"第{r}轮新来的一条")])))
+            assert st.log_size("c") > m, f"第 {r} 轮大跳之后又卡死了"
+    print("大跳不卡死 ok（零交集跳一轮 / 下一轮必须恢复 / 反复大跳也跟得上）")
+
+
 def check_log_cap():
     """每个联系人只留最新 MAX_LOG 条。"""
     with _Tmp() as st:
@@ -526,6 +569,7 @@ def main() -> None:
     check_unmovable_file_refuses_write()
     check_atomic_write_leaves_no_tmp()
     check_screen_batch_rules()
+    check_screen_batch_does_not_freeze()
     check_log_cap()
     check_note_matching()
     check_budget_trimming()

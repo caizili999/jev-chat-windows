@@ -313,8 +313,18 @@ class KbStore:
             elif k > 0:
                 tail = screen[k:]
             elif prev and not any(kk in prev_set for kk in keys):
-                # 跟上次那一屏毫无交集 → 在看更旧的消息，不是更新的。日志别动。
-                self._note(f"append_log: contact={contact_id} 跳过（翻到了上一屏之外）")
+                # 跟上次那一屏毫无交集。**这里其实分不清两种情况**：
+                #   ① 用户往上翻，在看我们早就存过的旧消息 → 不该在文件尾再抄一遍；
+                #   ② 两次分析之间一口气涌进来一整屏以上的新消息 → 本该记下来。
+                # 两种长得一模一样，上游按 ① 处理，照旧不写。
+                #
+                # 但**「上一屏」标记必须跟着更新**。不更新的话它会永远停在旧屏上，
+                # 于是之后每一轮都零交集、每一轮都走这个分支，日志从此再不增长
+                # ——真踩过：一口气聊了一屏多，日志 80 分钟一条没记，界面永远显示 18 条。
+                # 更新之后，下一轮只要屏幕是平滑前进的（跟这一屏有交集），就会正常补上。
+                self._note(f"append_log: contact={contact_id} 跳过这一屏"
+                           f"（跟上一屏零交集，可能是在往上翻）；上一屏标记已更新")
+                self._save_last_screen(contact_id, keys)
                 return True
             else:
                 tail = screen

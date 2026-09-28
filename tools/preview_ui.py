@@ -13,7 +13,8 @@
 --auto-send 决定自动发送那两行开关开哪个（开着的档位才会露出倒计时秒数、发送键和群昵称）；
 --state auto 额外把「N 秒后自动发送」那条倒计时摆出来；
 --kb 让知识库那一块出现（设置页那张卡 + 首页那行计数 +「存为联系人」按钮），
---kb-window 直接把「知识库与联系人」管理窗口截下来。
+--kb-window 直接把「知识库与联系人」管理窗口截下来，
+--kb-nothing 让首页那行改演「已识别到联系人，但没有可补的内容」那一态。
 
 **知识库的演示数据建在临时目录里**（`--kb` 时），跟「不碰真实数据」这条承诺一致。
 """
@@ -162,8 +163,11 @@ def main() -> int:
                              "演示数据建在临时目录里，不碰真实的 知识库/ 目录")
     parser.add_argument("--kb-window", action="store_true",
                         help="截图时改截「知识库与联系人」管理窗口（隐含 --kb）")
+    parser.add_argument("--kb-nothing", action="store_true",
+                        help="首页那行改演示「已识别到联系人，但没有可补的内容」那一态"
+                             "（隐含 --kb）。它跟「未使用知识库」是两句不同的话")
     args = parser.parse_args()
-    if args.kb_window:
+    if args.kb_window or args.kb_nothing:
         args.kb = True
     if args.state == "auto" and args.auto_send == "off":
         args.auto_send = "dm"  # 倒计时条只在开了自动发送时才有意义，别拍出一张自相矛盾的图
@@ -362,9 +366,15 @@ def main() -> int:
             ov.show(result)
             ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
             if args.kb:
-                # 首页那行「本轮已带上 N 条笔记、M 条历史」。真程序里由 main.build_knowledge()
-                # 每次分析前推过来；演示里写死一个数，好让这一行在截图里不是空的。
-                ov.set_context_info(2, 5)
+                # 首页那行「本轮带了什么」。真程序里由 main.build_knowledge() 每次分析前推过来；
+                # 演示里写死，好让这一行在截图里不是空的。
+                # --kb-nothing 演的是另一态：联系人命中了、但这一轮确实没东西可补
+                # （那一屏的消息全在屏幕上时就会这样）。它**不能**说成「未使用知识库」——
+                # 那正是用户以为功能坏了的那句（见 Overlay.set_context_info）。
+                if args.kb_nothing:
+                    ov.set_context_info(0, 0, contact_matched=True)
+                else:
+                    ov.set_context_info(2, 5)
             # 演示用的「有新版本」提示。地址指向本项目自己的仓库，别写成上游——
             # 截图里虽然只渲染「去下载」四个字，但源码里的地址会被读者当成真实更新源。
             ov.set_update("9.9.9", "https://github.com/caizili999/jev-chat-windows/releases/latest")
