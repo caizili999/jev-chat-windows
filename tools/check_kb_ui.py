@@ -51,6 +51,11 @@ def _read(path: str) -> dict:
         return json.load(f)
 
 
+# 下面两个由 __main__ 填好：桩不能只记文案，还得记 parent 才能查出「传错了对象」这类 bug。
+_toast_parents: list = []
+_real_toast = None
+
+
 def _on_settings_page(ov, widget) -> bool:
     """这个控件的父链通不通到设置页。构造了却没进布局的控件，父链是断的。"""
     node = widget.parentWidget()
@@ -254,6 +259,68 @@ def check_selfcheck(ov, store) -> None:
     assert names == ["用户的笔记"], f"自检留了残渣或动了用户数据：{names}"
 
 
+# ── 8b. 提示条 / 确认框的 parent 必须是真控件 ────────────────────────────────
+#
+# 这条是**真出过事**才加的：`_save_contact` 里写成了 `kb_ui.toast(self, …)`，而 Overlay
+# 的 `self` 是个普通 Python 对象、不是控件 → `QFrame.__init__(parent=<Overlay>)` 直接
+# ValueError。更糟的是它炸在**联系人已经写进磁盘之后**，用户看到的是堆栈而不是「已存为联系人」。
+#
+# 上一版的检查为什么没抓到：它用 `lambda parent, message: toasts.append(message)` 把 toast
+# 整个换掉了——**把被测的东西桩掉，就等于没测**。现在桩里会校验 parent 的类型，
+# 另外再拿真的 InfoBar 跑一次，确认那条路本身是通的。
+
+def check_toast_parent(ov, store, fake_toast) -> None:
+    """① 被记录下来的 parent 都必须是 QWidget；② 真的 InfoBar 能建起来；
+    ③ **拿真的 toast 把用户那次报错的场景原样重放一遍**。"""
+    from PySide6.QtWidgets import QWidget
+
+    bad = [(type(p).__name__) for p in _toast_parents if not isinstance(p, QWidget)]
+    assert not bad, (
+        f"toast/confirm 收到过不是控件的 parent：{bad}——"
+        "多半是把 Overlay 的 `self` 传进去了，应该写 `self.win`")
+
+    real_toast = _real_toast
+    ov.win.show()
+    ov.app.processEvents()
+
+    # 把真 toast 装回去，跑一遍真实的 _save_contact —— 这正是用户报错的那条路：
+    # 联系人是**先存好、再弹提示**的，所以提示条一崩，用户看到的就是「已经存好了」+ 一个堆栈。
+    overlay_mod.kb_ui.toast = real_toast
+    try:
+        ov.set_chat("检查群(3)")
+        try:
+            ov._save_contact()
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(
+                f"用真 toast 跑 _save_contact 抛了 {type(e).__name__}: {e}——"
+                "联系人都已经写进磁盘了，这一步不该崩") from e
+        assert "检查群" in [c.name for c in store.contacts()], \
+            f"联系人没存进去：{[c.name for c in store.contacts()]}"
+        assert "联系人" in ov.status.text(), f"状态栏该给出反馈：{ov.status.text()!r}"
+        ov.app.processEvents()
+
+        # 确认框同理：只构造、不 exec（exec 是模态的，会把脚本卡住）
+        from app.kb.ui import _ConfirmDialog
+        try:
+            dialog = _ConfirmDialog(ov.win, "检查用", "这条只是构造一下，不弹。")
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(
+                f"真的 _ConfirmDialog(ov.win, …) 构造失败：{type(e).__name__}: {e}") from e
+        dialog.deleteLater()
+        ov.app.processEvents()
+
+        # 兜底：万一以后又有人传了非控件，提示条该降级、不该崩
+        try:
+            real_toast(object(), "传错 parent 也不该崩")
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(
+                f"kb_ui.toast 收到非控件 parent 时抛了 {type(e).__name__}: {e}——"
+                "它只负责好看，出不来也不该把调用方那件「已经做完的事」变成一次崩溃") from e
+        ov.app.processEvents()
+    finally:
+        overlay_mod.kb_ui.toast = fake_toast
+
+
 # ── 9. main 那根线：app/kb → core 的唯一交接面 ──────────────────────────────
 
 def check_main_wiring(ov, store, path: str) -> None:
@@ -313,13 +380,24 @@ if __name__ == "__main__":
     path = _tmp_config({"relationship": "朋友"})
     kb_root = tempfile.mkdtemp(prefix="jev_kbui_store_")
     real_confirm, real_toast = overlay_mod.kb_ui.confirm, overlay_mod.kb_ui.toast
+    _real_toast = real_toast          # check_toast_parent 要拿真的那个再跑一遍
     toasts: list = []
     try:
         store = KbStore(kb_root)
-        # 确认框一律当「点了确定」，并且不弹窗（离屏下模态框会把脚本卡死）
-        overlay_mod.kb_ui.confirm = lambda *a, **k: True
-        # toast 换成记账本：既能断言文案，又不用真去建 InfoBar
-        overlay_mod.kb_ui.toast = lambda parent, message: toasts.append(message)
+
+        # 桩**不能只记文案**：上一版就是 `lambda parent, message: toasts.append(message)`，
+        # 把 parent 整个丢掉了，于是「传了 Overlay 而不是 self.win」这种 bug 从桩底下溜过去了。
+        # 现在把 parent 一起记下来，check_toast_parent 会校验它是不是真控件。
+        def fake_confirm(parent, *args, **kwargs):
+            _toast_parents.append(parent)
+            return True          # 一律当「点了确定」，并且不弹窗（离屏下模态框会把脚本卡死）
+
+        def fake_toast(parent, message):
+            _toast_parents.append(parent)
+            toasts.append(message)
+
+        overlay_mod.kb_ui.confirm = fake_confirm
+        overlay_mod.kb_ui.toast = fake_toast
 
         bare = Overlay(on_fill=lambda *a: None)
         check_absent(bare)
@@ -334,6 +412,7 @@ if __name__ == "__main__":
         check_open_and_clear(ov, store, toasts)
         check_selfcheck(ov, store)
         check_main_wiring(ov, store, path)
+        check_toast_parent(ov, store, fake_toast)
     finally:
         overlay_mod.kb_ui.confirm, overlay_mod.kb_ui.toast = real_confirm, real_toast
         try:
@@ -342,6 +421,7 @@ if __name__ == "__main__":
             pass
         shutil.rmtree(kb_root, ignore_errors=True)
     print("悬浮窗知识库接线检查通过"
-          "（无库时全隐藏 / 有库时可见 / 设置往返 / 跨字段提示 / 一键存 / 清空 / 自检 / main 接线）",
+          "（无库时全隐藏 / 有库时可见 / 设置往返 / 跨字段提示 / 一键存 / 清空 / 自检 / "
+          "main 接线 / 提示条的 parent 是真控件）",
           flush=True)
     os._exit(0)

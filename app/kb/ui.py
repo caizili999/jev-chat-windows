@@ -533,17 +533,42 @@ class KnowledgeWindow(QWidget):
 
 # ── 给悬浮窗用的两个小入口 ────────────────────────────────────────────────────
 # 悬浮窗不该去碰 MessageBoxBase / InfoBar 的细节，所以在这里包一层。
+#
+# ⚠️ 两个都**不能往外抛**，两个 parent 都必须是真 QWidget。
+# 踩过的坑：调用方传了 `self`——在 app/overlay.py 里 `self` 是 Overlay 那个**普通 Python
+# 对象**（不是控件），于是 `QFrame.__init__(parent=<Overlay>)` 直接 ValueError。
+# 更糟的是它炸在**事情已经做完之后**：联系人已经存进磁盘了，用户看到的却是一个堆栈。
+# 所以这里两层防护：parent 不是控件就退回 None；整个调用再包一层 try。
+# 提示条和确认框都只负责「好看 / 好问」，不负责「正确」。
 
 def confirm(parent, title: str, message: str, ok_text: str = "确定", danger: bool = False) -> bool:
-    """确认框，返回用户是否点了确定。"""
-    return bool(_ConfirmDialog(parent, title, message, ok_text, danger).exec())
+    """确认框，返回用户是否点了确定。
+
+    弹不出来时返回 **False**（= 当成用户没确认）。这个方向永远是安全的：调用它的地方
+    问的都是「要不要删」，答不上来就不删。
+    """
+    if not isinstance(parent, QWidget):
+        parent = None
+    try:
+        return bool(_ConfirmDialog(parent, title, message, ok_text, danger).exec())
+    except Exception:  # noqa: BLE001 —— 问不出来就不做，绝不往外抛
+        return False
 
 
-def toast(parent: QWidget, message: str):
-    """一句非阻塞提示（右下角浮一下就走，不打断操作）。"""
-    InfoBar.success(title="知识库", content=message, orient=Qt.Horizontal,
-                    isClosable=True, position=InfoBarPosition.TOP_RIGHT,
-                    duration=2500, parent=parent)
+def toast(parent, message: str):
+    """一句非阻塞提示（浮一下就走，不打断操作）。
+
+    出不来就算了——调用它的地方那件事**都已经做完了**（联系人已存、知识库已清空），
+    一个提示条弹不出来绝不能反过来让「已经存好了」看起来失败。
+    """
+    if not isinstance(parent, QWidget):
+        parent = None
+    try:
+        InfoBar.success(title="知识库", content=message, orient=Qt.Horizontal,
+                        isClosable=True, position=InfoBarPosition.TOP_RIGHT,
+                        duration=2500, parent=parent)
+    except Exception:  # noqa: BLE001 —— 提示弹不出来不是故障
+        pass
 
 
 # ── 小工具 ──────────────────────────────────────────────────────────────────

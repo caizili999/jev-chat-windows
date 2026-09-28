@@ -1573,6 +1573,9 @@ class Overlay:
     # ── 知识库 ──────────────────────────────────────────────────────────────
     # kb=None（几个离线工具构造 Overlay 时不传）时这些入口都不会被调到——按钮和整张卡
     # 都已经藏起来了。但每个入口仍先判一次，免得以后谁接错线时炸在更奇怪的地方。
+    # ⚠️ 这里 `self` 是 **Overlay 这个普通 Python 对象，不是控件**。凡是要给弹窗/提示条
+    # 当 parent 的地方，一律写 `self.win`——写成 `self` 会让 QFrame.__init__ 直接 ValueError，
+    # 而且炸在「联系人已经存好了」之后，用户看到的是一个堆栈而不是「已存为联系人」。
 
     def _kb_hint(self):
         """设置页知识库那块下面那行说明。跨字段的组合要在这里点破：
@@ -1615,7 +1618,7 @@ class Overlay:
             return
         counts = self.kb.counts()
         if counts.notes == 0 and counts.contacts == 0:
-            kb_ui.toast(self, "知识库本来就是空的")
+            kb_ui.toast(self.win, "知识库本来就是空的")
             return
         if not kb_ui.confirm(
                 self.win, "清空知识库",
@@ -1632,7 +1635,7 @@ class Overlay:
             self.kbWindow = None
         self.kbResult.setText("")
         self._kb_changed()
-        kb_ui.toast(self, "知识库已清空")
+        kb_ui.toast(self.win, "知识库已清空")
 
     def _selfcheck_kb(self):
         """跑一遍知识库自检（临时数据，跑完自删），把结果写在那行小字上。"""
@@ -1661,10 +1664,10 @@ class Overlay:
             message = self.kb.save_or_merge_contact(title, "wechat")
         except Exception as e:  # noqa: BLE001
             self.log(f"[存联系人失败] {type(e).__name__}: {e}")
-            kb_ui.toast(self, "存联系人失败，详见聊天记录")
+            kb_ui.toast(self.win, "存联系人失败，详见聊天记录")
             return
         self._kb_changed()
-        kb_ui.toast(self, message)
+        kb_ui.toast(self.win, message)
         self.set_status(message + "，可在设置 → 知识库与联系人里补关系和备注。", "success")
 
     def set_context_info(self, notes, history):
