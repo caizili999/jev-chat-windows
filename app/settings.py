@@ -386,6 +386,55 @@ def auto_send_group_any() -> bool:
     """
     return bool(_cfg().get("auto_send_group_any", False))
 
+
+# ── 按会话的自动回复授权（多独立窗口）─────────────────────────────────────────
+# 存的形状：{"auto_chats": {"1群": true, "老婆": true}}
+# 为什么按**会话名**存而不是按 hwnd：hwnd 每次开窗口都不一样（关掉重开就换一个），
+# 拿它当 key 等于每次都要重新授权。会话名是窗口标题，用户自己起的、稳定。
+# 代价是改了群名要重新授权一次——比「每次重启都重新授权」好得多。
+
+def auto_chat(title: str) -> bool:
+    """这个会话允许自动回复吗。**默认关**（没在这个 dict 里就是关）。
+
+    为什么要有这一层，而不是沿用全局那三个开关：独立窗口是**一直可见**的。
+    `auto_send_group_any`（群里不@我也回）在单窗口时代有个天然的刹车——窗口被别的窗口盖住、
+    或者用户压根没在看它；独立窗口把这层刹车拿掉了。109 人的群 + 不@我也回 + 窗口常驻，
+    就是持续刷屏，而且是在用户看不见的地方刷。所以授权必须**逐个窗口**给。
+
+    ⚠️ 这一层**只对独立窗口生效**（见 main.auto_allowed）：没有独立窗口的老用户走的是主窗口
+    那条路，判据还是全局那三个开关，一个字都不变——「不开独立窗口的老用户行为逐字节不变」。
+    """
+    d = _cfg().get("auto_chats")
+    if not isinstance(d, dict) or not isinstance(title, str):
+        return False
+    return bool(d.get(title.strip(), False))
+
+
+def save_auto_chat(title: str, on: bool) -> None:
+    """拨某一个会话的授权。**单独一条写路径，不走 save()**——理由跟 save_judge_engine 一样：
+    save() 要收二十来个参数，从一个开关去拼一整套当前值极容易漏项（漏了 = 把用户设置清成默认）。
+    这里只读文件、只改一个键、写回去。
+
+    关掉时**删键**而不是写 False：config.json 是用户会打开看的文件，
+    留一堆 `"某群": false` 只会让人以为那些群被特殊对待了。
+    """
+    if not isinstance(title, str) or not title.strip():
+        return
+    title = title.strip()
+    data = _cfg()
+    cur = data.get("auto_chats")
+    d = dict(cur) if isinstance(cur, dict) else {}
+    if on:
+        d[title] = True
+    else:
+        d.pop(title, None)
+    data["auto_chats"] = d
+    try:
+        _write_config(data)
+    except OSError:
+        pass  # 写不进去（文件只读之类）不该崩：开关看起来没生效，但程序照常能用
+
+
 def auto_send_any_wait() -> int:
     """「群里不@我也回」那条路的**安静窗口**（0~30，默认 AUTO_QUIET_SECONDS）。
 
@@ -695,4 +744,8 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
                    "auto_send_group_any": any_on, "auto_send_any_wait": any_wait,
                    "auto_send_delay": delay, "send_key": skey, "my_name": myname,
                    "draft_timeout": dto, "judge_timeout": jto, "candidate_count": cnt,
-                   "kb_history_enabled": kb_hist, "kb_history_count": kb_cnt})
+                   "kb_history_enabled": kb_hist, "kb_history_count": kb_cnt,
+                   # 按会话的自动回复授权**必须原样带过去**：save() 是「整份重写」，
+                   # 漏掉这个键就等于用户点一次「保存」，所有窗口的授权一次性全丢
+                   # （而它们不在设置页的输入框里，用户根本不会发现是自己弄丢的）
+                   "auto_chats": _cfg().get("auto_chats") or {}})

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CardWidget, FluentIcon as FIF, InfoBar, InfoBarPosition, LineEdit,
+    BodyLabel, CardWidget, ComboBox, FluentIcon as FIF, InfoBar, InfoBarPosition, LineEdit,
     MessageBoxBase, PlainTextEdit, PrimaryPushButton, PushButton, SubtitleLabel,
     SwitchButton, TransparentToolButton, setCustomStyleSheet, setFont,
 )
@@ -266,12 +266,19 @@ class _ConfirmDialog(_BaseDialog):
 # ── 主窗口 ──────────────────────────────────────────────────────────────────
 
 class KnowledgeWindow(QWidget):
-    """知识库与联系人。`on_change()` 在每次改动之后调一次，让外面刷新计数那行。"""
+    """知识库与联系人。`on_change()` 在每次改动之后调一次，让外面刷新计数那行。
 
-    def __init__(self, store, on_change=None, parent=None):
+    `windows_of()` → 现在屏幕上开着的独立聊天窗口标题列表（没有就返回空）。
+    **不给就整栏不出现**——离线工具和单窗口用户看到的界面跟加这个功能之前一模一样。
+    这一栏存在的原因见 `_windows_card` 的注释：会话名改成窗口标题之后，
+    现有联系人一个都对不上，不配一次那些历史会静默失效。
+    """
+
+    def __init__(self, store, on_change=None, parent=None, windows_of=None):
         super().__init__(parent)
         self.store = store
         self.on_change = on_change
+        self.windows_of = windows_of
         self._tab = 0
         self.setWindowTitle("Jev · 知识库与联系人")
         self.setMinimumSize(520, 560)
@@ -321,6 +328,11 @@ class KnowledgeWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def select_contacts(self):
+        """切到「联系人」页。悬浮窗那条「去配对」提示条用它——「当前看到的窗口」
+        那一栏在联系人页里，只把窗口打开、停在笔记页，用户还是找不到。"""
+        self._select(1)
 
     # ── 渲染 ────────────────────────────────────────────────────────────────
 
@@ -449,6 +461,10 @@ class KnowledgeWindow(QWidget):
         row.addStretch(1)
         self.body.addLayout(row)
 
+        card = self._windows_card()
+        if card is not None:
+            self.body.addWidget(card)
+
         contacts = sorted(self.store.contacts(), key=lambda c: c.updated_at, reverse=True)
         if not contacts:
             self.body.addWidget(_empty_card(
@@ -460,6 +476,88 @@ class KnowledgeWindow(QWidget):
                 "点条目编辑。会话标题等于名字或任一别名即算命中（忽略大小写与群人数后缀）。",
                 11, _SUB))
         self.body.addStretch(1)
+
+    def _windows_card(self):
+        """「当前看到的窗口」——把每个独立窗口的标题配到一个联系人（写进它的别名）。
+
+        ⚠️ **这一栏是多独立窗口这条路最要紧的一步，不是锦上添花。**
+
+        会话名以前是 OCR 主窗口头部得来的，现在是 Windows 窗口标题——两者对不上：
+        `1群` vs 联系人 `1群(4)Q`（那个 Q 是 OCR 把 🔍 搜索图标认成的字）、
+        `程序员烧烤🦞技术交流群v3.0` vs `程序员烧烤技术交流群v3.0`（存的时候 🦞 丢了）。
+        不配一次，用户现有的几十上百条历史会**静默**对不上——首页只是从
+        「用了知识库」变成「本轮未使用知识库」，他只会以为功能坏了。
+        点一下把窗口标题写进那个联系人的别名，两条路（主窗口 / 独立窗口）就统一到同一个 key 了。
+
+        没有 windows_of（离线工具、或者用户压根没开独立窗口）时整栏不出现。
+        """
+        if self.windows_of is None:
+            return None
+        try:
+            titles = [t for t in (self.windows_of() or []) if t]
+        except Exception:  # noqa: BLE001 —— 拿窗口列表失败不该让知识库窗口打不开
+            return None
+        if not titles:
+            return None
+
+        card = _card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(14, 12, 14, 12)
+        box.setSpacing(6)
+        box.addWidget(_label("当前看到的窗口", 15, _INK, True))
+        box.addWidget(_label(
+            "微信里每个独立窗口算一个会话，会话名就是窗口标题。点「配到…」把它配到某个联系人"
+            "（会写进那个联系人的别名）——配好之后这个窗口的历史和关系备注就都能用上了。",
+            12, _SUB))
+
+        contacts = sorted(self.store.contacts(), key=lambda c: c.name)
+        for title in titles:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            hit = self.store.find_contact(title, "wechat")
+            left = QVBoxLayout()
+            left.setSpacing(2)
+            left.addWidget(_label(title, 13, _INK, True))
+            left.addWidget(_label(f"已配到「{hit.name}」" if hit else "还没配到联系人", 11, _SUB))
+            row.addLayout(left, 1)
+
+            if contacts:
+                pick = ComboBox()
+                pick.setMinimumWidth(0)
+                pick.setAccessibleName(f"把「{title}」配到哪个联系人")
+                names = [c.name or "（无名）" for c in contacts]
+                pick.addItems(names)
+                # 已经配上的就把它预选上：不然一边写着「已配到『X』」、下拉里却是别人，
+                # 看着像显示错了。顺带让「已经配好的」再点一次也是无操作（add_alias 返回 False）。
+                want = (hit.name or "（无名）") if hit else None
+                pick.setCurrentIndex(names.index(want) if want in names else 0)
+                row.addWidget(pick)
+                button = PushButton("配到…")
+                button.setAccessibleName(f"把「{title}」配到选中的联系人")
+                button.setMinimumHeight(28)
+                button.clicked.connect(
+                    lambda _c=False, t=title, p=pick: self._pair_window(t, contacts, p))
+                row.addWidget(button)
+            else:
+                row.addWidget(_label("先去下面新建一个联系人", 11, _SUB))
+            box.addLayout(row)
+        return card
+
+    def _pair_window(self, title: str, contacts, pick):
+        """把窗口标题写进选中的那个联系人的别名。"""
+        index = pick.currentIndex()
+        if not (0 <= index < len(contacts)):
+            return
+        contact = contacts[index]
+        if self.store.add_alias(contact.id, title):
+            toast(self, f"已把「{title}」配到「{contact.name}」")
+            if self.on_change:
+                self.on_change()
+            self.refresh()
+        else:
+            # 两种「没写」：已经在了，或者这个标题归一化之后跟名字/别的别名撞了。
+            # 都当成功说一遍，否则用户会以为按钮坏了。
+            toast(self, f"「{title}」已经在「{contact.name}」的别名里了")
 
     def _contact_card(self, contact: Contact):
         card = _ClickCard(lambda: self._edit_contact(contact))
@@ -569,6 +667,38 @@ def toast(parent, message: str):
                         duration=2500, parent=parent)
     except Exception:  # noqa: BLE001 —— 提示弹不出来不是故障
         pass
+
+
+def toast_unpaired(parent, title: str, on_open=None):
+    """「这个独立窗口还没配到联系人」的**非模态**提示条。返回那条 InfoBar（方便测）。
+
+    ⚠️ **必须非模态**：调用它的是 main 的 tick()，而 `ov.after(50, tick)` 是 tick() 的
+    **最后一行**。在 tick() 里弹模态框（MessageBoxBase.exec()）会让父进程彻底停死
+    ——子进程还在截图、队列一直堆、没人消费（见 docs/DESIGN_MULTIWINDOW.md §6.3）。
+
+    比 toast() 停得久一点（要够用户读完再决定去不去配），并带一个「去配对」按钮：
+    光说一句「对不上」而不给出口，用户还是不知道点哪儿——而这一栏存在的全部意义
+    就是让他去点那一下（会话名从 OCR 头部改成窗口标题之后，现有联系人对不上，
+    不配一次那些历史会静默失效，见 DESIGN_MULTIWINDOW §6.2）。
+    """
+    if not isinstance(parent, QWidget):
+        parent = None
+    try:
+        bar = InfoBar.warning(
+            title="有个窗口还没配到联系人",
+            content=f"「{title}」跟知识库里哪个联系人都对不上，它以前的记录用不上。",
+            orient=Qt.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT, duration=8000, parent=parent)
+        if on_open is not None:
+            button = PushButton("去配对")
+            button.setFixedHeight(26)
+            button.setAccessibleName(f"去知识库把「{title}」配到联系人")
+            # 先收掉提示条再开窗口：知识库窗口一出来就把提示条压在下面，看着像没反应
+            button.clicked.connect(lambda: (bar.close(), on_open()))
+            bar.addWidget(button)
+        return bar
+    except Exception:  # noqa: BLE001 —— 提示弹不出来不是故障
+        return None
 
 
 # ── 小工具 ──────────────────────────────────────────────────────────────────

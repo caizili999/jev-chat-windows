@@ -643,22 +643,33 @@ def check_main_gates() -> None:
         def begin_auto(self, text, seconds, note=""):
             calls.append(("begin", text, seconds, note))
 
+        def auto_pending(self):
+            # 「有没有别的会话正在倒计时」。排队那半边由 check_multiwindow 专门验，
+            # 这里一律返回 False = 没有别的会话在倒计时，走的是「直接摆出来」那条路。
+            return False
+
     result = {"candidates": ["甲", "乙", "丙"], "best_index": 1, "judged": True}
     no_judge = {"candidates": ["甲", "乙", "丙"], "best_index": None, "judged": False}
     real = (settings.auto_send_on, settings.auto_send_dm, settings.auto_send_group,
-            settings.auto_send_group_any, settings.auto_send_delay, settings.my_name)
+            settings.auto_send_group_any, settings.auto_send_delay, settings.my_name,
+            settings.auto_chat)
     settings.auto_send_on = lambda: True
     settings.auto_send_dm = lambda: True
     settings.auto_send_group = lambda: False
     settings.auto_send_group_any = lambda: False
     settings.auto_send_delay = lambda: 5
     settings.my_name = lambda: ""
+    settings.auto_chat = lambda title: True  # 按会话授权：默认关，这里先全开（下面单独验它）
     try:
         def run(batches, triggered_by_message, can=True, group=False, my_name="",
-                res=None, last_text="@小金 在吗"):
+                res=None, last_text="@小金 在吗", is_main=True):
             calls.clear()
             main.chats = {}
             main.state["batches"] = {"小分队": batches}
+            # 这个会话挂在哪个窗口上——auto_allowed() 靠 is_main 分路：
+            # 主窗口走老闸（ov.can_auto_send），独立窗口不看界面正看着谁。
+            main.state["wins"] = {"小分队": {"hwnd": 1, "area": (0, 0, 10, 10),
+                                            "is_main": is_main}}
             chat = main.chat_of("小分队")
             chat["auto"] = triggered_by_message
             if group:
@@ -698,6 +709,37 @@ def check_main_gates() -> None:
         assert not begins(got), got
         assert any("正看着的" in c[1] for c in got if c[0] == "log"), got
         assert any("别的会话" in c[1] for c in statuses(got)), got
+
+        # **独立窗口**：同样「界面不允许」，但照样发。每个窗口钉住自己的会话，
+        # 「往错窗口发」在物理上不可能发生，而用户要的正是「三个会话都自动回」。
+        # 真正的闸在 auto_send_reply 里（按会话查窗口 + 重读窗口标题）。
+        got = run(5, True, can=False, is_main=False)
+        assert begins(got) == [("begin", "乙", 5, "")], got
+
+        # **独立窗口要逐个授权**（新窗口默认关）：没授权就不发，而且要说清去哪儿开。
+        # 109 人的群 + 「不@我也回」+ 窗口常驻 = 持续刷屏，而且是在用户看不见的地方刷。
+        settings.auto_chat = lambda title: False
+        got = run(5, True, is_main=False)
+        assert not begins(got), got
+        assert any("还没授权" in c[1] for c in statuses(got)), got
+        assert any("还没授权" in c[1] for c in got if c[0] == "log"), got
+        # 主窗口**不受这条影响**：没有独立窗口的老用户行为必须逐字节不变
+        got = run(5, True, is_main=True)
+        assert begins(got) == [("begin", "乙", 5, "")], got
+        settings.auto_chat = lambda title: True
+
+        # 窗口没了（关掉了）→ 不发。这是独立窗口那条路唯一的「界面侧」前提。
+        main.chats = {}
+        main.state["batches"] = {"小分队": 5}
+        main.state["wins"] = {}
+        chat = main.chat_of("小分队")
+        chat["auto"] = True
+        chat["history"].append(("her", "@小金 在吗", None))
+        main.ov = FakeOv(True)
+        calls.clear()
+        main.start_auto("小分队", {"candidates": ["甲", "乙", "丙"], "best_index": 1,
+                                   "judged": True})
+        assert not [c for c in calls if c[0] == "begin"], calls
 
         # 全都满足 → 发的是**推荐那条**（best_index=1），不是第一条；note 为空
         assert run(2, True) == [("begin", "乙", 5, "")], run(2, True)
@@ -744,7 +786,8 @@ def check_main_gates() -> None:
         settings.auto_send_group_any = lambda: False
     finally:
         (settings.auto_send_on, settings.auto_send_dm, settings.auto_send_group,
-         settings.auto_send_group_any, settings.auto_send_delay, settings.my_name) = real
+         settings.auto_send_group_any, settings.auto_send_delay, settings.my_name,
+         settings.auto_chat) = real
     print("main.start_auto() 门禁 ok")
 
 
@@ -760,13 +803,37 @@ def check_send_gate() -> None:
     main.send_text = lambda hwnd, area, text, key: (sent.append((text, key)), "Enter")[1]
     real_key = settings.send_key
     settings.send_key = lambda: "ctrl_enter"
+    # 独立窗口那三道新闸（句柄有效 / 窗口标题还是它 / 用户走开了）由 check_multiwindow 专门验。
+    # 这里一律放行，好让本组只盯「按会话查窗口」这一件事。
+    real_guards = (main.W.alive, main.W.title_of, main.focus.user_is_away)
+    main.W.alive = lambda hwnd: True
+    main.W.title_of = lambda hwnd: main.state["auto_title"]
+    main.focus.user_is_away = lambda: True
+
+    def base():
+        """每个用例都从「一切正常」出发：会话挂在主窗口上、输入框是空的、不忙、倒计时就是它。"""
+        main.state["wins"] = {"小分队": {"hwnd": 1, "area": (0, 0, 10, 10), "is_main": True}}
+        main.state["chat"] = "小分队"
+        main.state["auto_title"] = "小分队"
+        main.state["input_has"] = {"小分队": False}
+        main.state["busy"] = False
 
     def run(**over):
         sent.clear()
         statuses.clear()
-        main.state.update({"hwnd": 1, "area": (0, 0, 10, 10), "chat": "小分队",
-                           "auto_title": "小分队", "input_has": False, "busy": False})
-        main.state.update(over)
+        base()
+        if "input_has" in over:
+            main.state["input_has"]["小分队"] = over["input_has"]
+        if "chat" in over:
+            main.state["chat"] = over["chat"]
+        if "busy" in over:
+            main.state["busy"] = over["busy"]
+        if "auto_title" in over:
+            main.state["auto_title"] = over["auto_title"]
+        if "area" in over:
+            main.state["wins"]["小分队"]["area"] = over["area"]
+        if over.get("no_win"):
+            main.state["wins"].pop("小分队", None)
         main.auto_send_reply("甲")
 
     try:
@@ -779,7 +846,7 @@ def check_send_gate() -> None:
                             ({"input_has": None}, "输入框里已经有内容"),
                             ({"chat": "别的会话"}, "切到别的会话"),
                             ({"busy": True}, "又在生成"),
-                            ({"hwnd": None}, "不可用"),
+                            ({"no_win": True}, "窗口已经不在了"),
                             ({"area": None}, "不可用"),
                             ({"auto_title": ""}, "不知道这条回复属于哪个会话")):
             run(**over)
@@ -787,9 +854,17 @@ def check_send_gate() -> None:
             assert any(token in s[0] for s in statuses), (over, statuses)
             assert any("取消" in line for line in logs), logs
 
-        # 界面自己切走了（微信还开着那个会话）也要拦
-        main.state.update({"hwnd": 1, "area": (0, 0, 10, 10), "chat": "小分队",
-                           "auto_title": "小分队", "input_has": False, "busy": False})
+        # **按会话**：这个会话的窗口还在，但**别的**会话的窗口没了——不该影响它。
+        # 这是多独立窗口下最容易写错的一处：把「有窗口」写成一个全局判断，
+        # 关掉任何一个窗口都会让所有会话都发不出去。
+        base()
+        main.state["wins"]["别的会话"] = {"hwnd": 2, "area": (0, 0, 10, 10), "is_main": False}
+        sent.clear()
+        main.auto_send_reply("甲")
+        assert sent == [("甲", "ctrl_enter")], f"别的会话的窗口在不在跟它无关：{sent}"
+
+        # 界面自己切走了（微信还开着那个会话）也要拦——主窗口独有的老闸
+        base()
         main.ov = SimpleNamespace(set_status=lambda text, kind="idle": statuses.append((text, kind)),
                                   log=lambda line: logs.append(line),
                                   after=lambda ms, fn: None,
@@ -799,22 +874,36 @@ def check_send_gate() -> None:
         main.auto_send_reply("甲")
         assert sent == [] and any("界面已经切到别的会话" in s[0] for s in statuses), statuses
 
-        # 发完之后那一眼：输入框里还有内容 = 发送键多半跟微信设置不一致
+        # **独立窗口不走那条老闸**：界面正看着别的会话，但这个会话有自己的窗口，
+        # 该发还是发（这正是「三个会话都自动回」的落点）。
+        base()
+        main.state["wins"]["小分队"]["is_main"] = False
+        sent.clear()
         statuses.clear()
-        main.state["chat"] = "小分队"
-        main.state["input_has"] = True
+        main.auto_send_reply("甲")
+        assert sent == [("甲", "ctrl_enter")], f"独立窗口不该被「界面正看着谁」拦住：{sent}"
+
+        # 发完之后那一眼：输入框里还有内容 = 发送键多半跟微信设置不一致
+        main.ov = SimpleNamespace(set_status=lambda text, kind="idle": statuses.append((text, kind)),
+                                  log=lambda line: logs.append(line),
+                                  after=lambda ms, fn: None,
+                                  current_chat=lambda: main.state["chat"])
+        base()
+        statuses.clear()
+        main.state["input_has"]["小分队"] = True
         main.check_auto_sent("小分队")
         assert any("发送键" in s[0] for s in statuses), statuses
         statuses.clear()
-        main.state["input_has"] = False  # 发出去了，框是空的 → 不该报警
+        main.state["input_has"]["小分队"] = False  # 发出去了，框是空的 → 不该报警
         main.check_auto_sent("小分队")
         assert statuses == [], statuses
         statuses.clear()
-        main.state["input_has"] = True
+        main.state["input_has"]["小分队"] = True
         main.check_auto_sent("别的会话")  # 已经切走了，那一眼看的不是同一件事
         assert statuses == [], statuses
     finally:
         settings.send_key = real_key
+        (main.W.alive, main.W.title_of, main.focus.user_is_away) = real_guards
     print("main.auto_send_reply() 发送前确认 ok")
 
 
@@ -918,6 +1007,54 @@ def check_quiet_window() -> None:
         settings.auto_send_group_any, settings.my_name, main.start_analyze = real
 
 
+def check_auto_chat_auth(path: str) -> None:
+    """按会话的自动回复授权：默认关、能存能读、关掉删键、**save() 不会顺手清掉它**。
+
+    这是「新窗口默认关」那一条的实现。最后那条最要紧：save() 是整份重写，
+    漏掉这个键就等于用户点一次「保存」把所有窗口的授权一次性清光，
+    而它们不在设置页的输入框里——用户根本不会发现是自己弄丢的。
+    """
+    _write(path)
+    assert settings.auto_chat("1群") is False, "没授权过的会话必须默认关（新窗口默认关）"
+    assert settings.auto_chat("") is False
+    # 脏值一律当「没授权」，不能炸（会话名是从窗口标题来的，理论上可能什么都传进来）
+    for dirty in (None, 123, ["1群"], True):
+        assert settings.auto_chat(dirty) is False, f"脏会话名放行了：{dirty!r}"
+
+    settings.save_auto_chat("1群", True)
+    assert settings.auto_chat("1群") is True
+    assert settings.auto_chat("老婆") is False, "别的会话不该被一起打开"
+    assert _read(path)["auto_chats"] == {"1群": True}
+
+    settings.save_auto_chat("老婆", True)
+    assert _read(path)["auto_chats"] == {"1群": True, "老婆": True}
+
+    # 关掉 = **删键**，不在 config.json 里留一堆 false——那是用户会打开看的文件，
+    # 留着一堆 false 只会让人以为那些群被特殊对待了
+    settings.save_auto_chat("1群", False)
+    assert _read(path)["auto_chats"] == {"老婆": True}
+    assert settings.auto_chat("1群") is False
+
+    # 空/脏会话名不写（窗口标题可能是空的，那是「还没 OCR 出来」的占位，不是会话名）
+    settings.save_auto_chat("   ", True)
+    settings.save_auto_chat(None, True)
+    settings.save_auto_chat(123, True)
+    assert _read(path)["auto_chats"] == {"老婆": True}, "脏会话名写进去了"
+
+    # ⚠️ save() 整份重写时**必须原样带上** auto_chats
+    settings.save(None, "朋友", auto_send_delay_n=7)
+    assert _read(path)["auto_chats"] == {"老婆": True}, "save() 把按会话授权清掉了"
+    assert settings.auto_chat("老婆") is True
+
+    # config 里的 auto_chats 是脏值时也不能炸、也不能被当成授权
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"relationship": "朋友", "auto_chats": "乱写的"}, f, ensure_ascii=False)
+    assert settings.auto_chat("老婆") is False, "脏 auto_chats 被当成授权了"
+    settings.save_auto_chat("老婆", True)  # 脏值之上还能正常写
+    assert settings.auto_chat("老婆") is True and _read(path)["auto_chats"] == {"老婆": True}
+    print("settings 按会话自动回复授权 ok（默认关 / 关掉删键 / save 不清掉 / 脏值不炸）")
+
+
 def main_check() -> int:
     check_input_has_text()
     check_at_me()
@@ -928,6 +1065,7 @@ def main_check() -> int:
     try:
         check_settings_defaults(path)
         check_settings_save(path)
+        check_auto_chat_auth(path)
         # 造 Overlay 之前先把配置复位，免得 _load_settings 读到上一个检查留下的开关
         _write(path)
         ov = Overlay(on_fill=lambda *a: None)

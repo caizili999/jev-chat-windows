@@ -452,6 +452,55 @@ def check_contact_matching_and_merge():
     print("联系人 ok（一键存/并入/去人数/来源优先/不自动创建/删人连带删历史）")
 
 
+def check_add_alias():
+    """`add_alias`：把窗口标题写进联系人的别名，让「独立窗口」那条路也能命中同一个联系人。
+
+    ⚠️ 这一条是多独立窗口最要紧的一步，不是锦上添花。会话名从「OCR 主窗口头部」改成
+    「Windows 窗口标题」之后，窗口标题跟现有联系人**一个都对不上**：
+    `1群` vs `1群(4)Q`、`程序员烧烤🦞技术交流群v3.0` vs `程序员烧烤技术交流群v3.0`。
+    不配一次，用户现有那几十上百条历史会**静默**对不上——首页只是从「用了知识库」
+    变成「本轮未使用知识库」，他只会以为功能坏了。
+
+    而上面那条「一键存」的路走不通：它的并入分支永远不成立（见 check_contact_matching_and_merge
+    里的注释），压根记录不下新的拼写。所以配对必须有这条独立的路。
+    """
+    with _Tmp() as st:
+        st.save_contact(Contact(id="c1", name="1群(4)Q", apps=[_APP]))
+        # 配之前：窗口标题「1群」认不出来——这正是那个静默失效的样子
+        assert st.find_contact("1群", _APP) is None, "不该凭空匹配上"
+
+        assert st.add_alias("c1", "1群") is True
+        assert st.find_contact("1群", _APP).id == "c1", "配对之后必须命中同一个联系人"
+        assert st.find_contact("1群(4)Q", _APP).id == "c1", "原来的写法也要照样命中"
+        assert st.contact("c1").aliases == ["1群"]
+
+        # 重复配 / 归一化之后撞上已有的（大小写、零宽字符、群人数后缀都算同一个）
+        assert st.add_alias("c1", "1群") is False
+        assert st.add_alias("c1", "1群\u200b") is False
+        assert st.add_alias("c1", " 1群 ") is False
+        assert st.contact("c1").aliases == ["1群"], "重复的别名不该堆进去"
+
+        # emoji 也要能配（实测那条群名里有个 🦞）
+        st.save_contact(Contact(id="c2", name="程序员烧烤技术交流群v3.0", apps=[_APP]))
+        assert st.find_contact("程序员烧烤🦞技术交流群v3.0", _APP) is None
+        assert st.add_alias("c2", "程序员烧烤🦞技术交流群v3.0") is True
+        assert st.find_contact("程序员烧烤🦞技术交流群v3.0", _APP).id == "c2"
+
+        # 脏值 / 不存在的联系人都不能炸、也不能写进去
+        before = st.contacts()
+        assert st.add_alias("c2", "") is False
+        assert st.add_alias("c2", "   ") is False
+        assert st.add_alias("c2", None) is False
+        assert st.add_alias("c2", 123) is False
+        assert st.add_alias("查无此id", "1群2") is False
+        assert st.contacts() == before, "上面这些都不该改动任何联系人"
+
+        # 别名是**写进文件**的：换一个 store 实例读回来还得在（不然重启就白配了）
+        again = type(st)(st.root)
+        assert again.find_contact("1群", _APP).id == "c1", "别名没落盘"
+    print("联系人配对 add_alias ok（窗口标题进别名 / 重复不堆 / emoji 也能配 / 脏值不炸 / 落盘）")
+
+
 # ── ChatContext 的 background / is_empty ────────────────────────────────────
 
 def check_background_format():
@@ -575,6 +624,7 @@ def main() -> None:
     check_budget_trimming()
     check_history_dedupe_order()
     check_contact_matching_and_merge()
+    check_add_alias()
     check_background_format()
     check_clear_all_only_touches_kb()
     check_selfcheck()

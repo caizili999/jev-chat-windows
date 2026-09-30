@@ -342,7 +342,8 @@ class _ReplyCard(_Surface):
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_auto_send=None, on_settings_change=None, on_toggle_judge=None,
-                 kb=None, on_kb_change=None):
+                 kb=None, on_kb_change=None, on_auto_chat_change=None, own_window_of=None,
+                 windows_of=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_auto_send(文本) → 倒计时走完、该按发送键了。**界面只负责倒计时和取消**，
@@ -354,6 +355,14 @@ class Overlay:
         「存为联系人」按钮全都藏起来），行为跟加这个功能之前一模一样——几个离线工具
         构造 Overlay 时就是这么用的。
         on_kb_change() → 知识库内容变了（新建/编辑/删除/清空/一键存联系人）。main 用它刷新计数。
+        own_window_of(会话名) → 这个会话有没有**自己的独立窗口**。首页那个「允许自动回复」
+        开关只对独立窗口的会话出现——主窗口（回退路径）走的是全局那三个开关，多一个开关
+        只会让老用户以为自己的设置被改了。**不给就整行不出现**（离线工具就是这样）。
+        on_auto_chat_change(会话名, 要不要允许) → 用户拨了那个开关。**由 main 负责存**
+        （跟 on_toggle_judge 一个道理：持久化只留一条路）。
+        windows_of() → 现在屏幕上开着的独立聊天窗口标题列表。知识库窗口那栏
+        「当前看到的窗口」用它做配对（会话名从 OCR 改成窗口标题之后，现有联系人会对不上，
+        见 app/kb/ui.py 的 _windows_card）。**不给那一栏就不出现。**
         """
         self.app = QApplication.instance() or QApplication([])
         setTheme(Theme.LIGHT)
@@ -367,6 +376,9 @@ class Overlay:
         self.on_toggle_judge = on_toggle_judge
         self.kb = kb
         self.on_kb_change = on_kb_change
+        self.on_auto_chat_change = on_auto_chat_change
+        self.own_window_of = own_window_of
+        self.windows_of = windows_of
         self.kbWindow = None   # 懒建：用户不点「知识库与联系人」就不构造那个窗口
         self.cands = []
         self.cards = []
@@ -381,6 +393,10 @@ class Overlay:
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
         self._chat = ""  # 微信当前开着的会话
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
+        # 会话标签页（D11）。只在「有自己独立窗口的会话 ≥ 2 个」时才真的画出来，
+        # 见 _render_session_tabs。这两个是**普通列表**（不是控件），所以布局检查会跳过。
+        self._tabButtons = []
+        self._tabTitles = []
         # 自动发送的倒计时。_autoPending 是「这一枪还开着吗」——取消和到点之间有个 150ms 的
         # 空档，没有它就会出现「点了取消照样发出去」。
         self._autoText = ""
@@ -588,6 +604,46 @@ class Overlay:
         self.chatFollow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         chat_row.addWidget(self.chatFollow)
         body.addLayout(chat_row)
+        # 会话标签页（D11）：**只在真的有多个独立窗口时出现**。
+        #
+        # 为什么要有它：独立窗口是用户手动开的一批，主窗口那边「微信切到哪个会话」这个动作
+        # 根本不存在——三个窗口同时在盯，得有个地方一眼看清「现在盯的是哪几个、哪个是活的」，
+        # 而不是在下拉框里逐个翻。点一下只换悬浮窗**看**谁，微信那边一个都不动。
+        #
+        # 为什么只在 ≥2 个独立窗口时出现：单个会话（包括所有老用户）看到的界面必须一个像素
+        # 都不变——没有 own_window_of（离线工具就是这么构造的）、或者只有 0/1 个独立窗口时
+        # 整行 hide()，hide 的控件不参与布局、不占高度，跟加这个功能之前完全一样。
+        self.sessionTabs = QWidget()
+        tabs_row = QHBoxLayout(self.sessionTabs)
+        tabs_row.setContentsMargins(0, 0, 0, 0)
+        tabs_row.setSpacing(6)
+        self.sessionTabs.hide()
+        body.addWidget(self.sessionTabs)
+        # 这个会话允不允许自动回复。**只对独立窗口的会话出现**——独立窗口一直可见，
+        # 群里「不@我也回」在单窗口时代靠「窗口被盖住/没人在看」天然有个刹车，
+        # 独立窗口把这层刹车拿掉了，所以授权必须逐个窗口给（新窗口默认关）。
+        # 主窗口（回退路径）不出现这一行：那边走的是全局那三个开关，多一个开关只会让
+        # 老用户以为自己的设置被改了。
+        self.autoChatRow = QWidget()
+        auto_chat_row = QHBoxLayout(self.autoChatRow)
+        auto_chat_row.setContentsMargins(0, 0, 0, 0)
+        auto_chat_row.setSpacing(8)
+        auto_chat_prefix = _label("自动回复", 12, _MUTED)
+        auto_chat_prefix.setFixedWidth(56)
+        auto_chat_row.addWidget(auto_chat_prefix)
+        self.autoChatSwitch = SwitchButton()
+        self.autoChatSwitch.setOnText("允许")
+        self.autoChatSwitch.setOffText("不允许")
+        self.autoChatSwitch.setAccessibleName("允许这个会话自动回复")
+        self.autoChatSwitch.setToolTip(
+            "这个独立窗口的会话允不允许自动发送。新开的窗口默认不允许——"
+            "独立窗口一直在屏幕上，群里「不@我也回」少了这层授权就会变成持续刷屏。")
+        self.autoChatSwitch.checkedChanged.connect(self._on_auto_chat_toggled)
+        auto_chat_row.addWidget(self.autoChatSwitch)
+        self.autoChatNote = _label("", 11, _MUTED)
+        auto_chat_row.addWidget(self.autoChatNote, 1)
+        self.autoChatRow.hide()
+        body.addWidget(self.autoChatRow)
         self.targetRow = QWidget()  # 只有开了「群聊指定回复对象」且这个会话是群聊才露出来
         target_row = QHBoxLayout(self.targetRow)
         target_row.setContentsMargins(0, 0, 0, 0)
@@ -1596,8 +1652,35 @@ class Overlay:
         if self.kb is None:
             return
         if self.kbWindow is None:
-            self.kbWindow = kb_ui.KnowledgeWindow(self.kb, on_change=self._kb_changed)
+            self.kbWindow = kb_ui.KnowledgeWindow(self.kb, on_change=self._kb_changed,
+                                                  windows_of=self.windows_of)
         self.kbWindow.show_and_raise()
+
+    def notify_unpaired(self, title):
+        """某个独立窗口的标题跟知识库联系人一个都对不上：**非模态**说一句，并给个出口。
+
+        这是「会话名从 OCR 头部改成窗口标题」的必然后果（DESIGN_MULTIWINDOW §6.2）：
+        窗口标题跟现有联系人一个都对不上，不配一次那些历史会**静默**失效。
+        **绝不能用模态框**——调用它的是 main 的 tick()，而 `after(50, tick)` 是 tick()
+        的最后一行，模态框会把父进程彻底停死（§6.3）。
+
+        没有知识库（kb=None）时什么都不做：那种情况下根本没有「配到联系人」这回事，
+        首页那行计数、设置页那张卡也都不存在，凭空冒一个提示条就破坏「不加知识库
+        就逐字节不变」这条最硬的约束。
+        """
+        if self.kb is None:
+            return
+        kb_ui.toast_unpaired(self.win, title, on_open=self._open_kb_for_pairing)
+
+    def _open_kb_for_pairing(self):
+        """点提示条上的「去配对」：打开知识库窗口并**直接切到联系人页**——
+        「当前看到的窗口」那一栏在联系人页里，停在笔记页用户还是找不到。"""
+        self._open_kb()
+        if self.kbWindow is not None:
+            try:
+                self.kbWindow.select_contacts()
+            except Exception:  # noqa: BLE001 —— 切页失败也不该把「窗口已经开了」变成一次崩溃
+                pass
 
     def _kb_changed(self):
         """知识库里动过东西（新建/编辑/删除/清空/一键存联系人）。
@@ -2058,6 +2141,7 @@ class Overlay:
         self.chatBox.blockSignals(True)
         self.chatBox.addItem(title)
         self.chatBox.blockSignals(False)
+        self._render_session_tabs()   # 会话集合变了，标签页跟着变
 
     def _on_chat_selected(self, index):
         """用户自己挑了一个会话：只换看的内容，微信那边不动。"""
@@ -2079,7 +2163,82 @@ class Overlay:
         self._history_title()
         self._follow_text()
         self._render_targets()
+        self._sync_auto_chat()
+        self._style_session_tabs()
         self.show_cached(self.result_of(title) if self.result_of else None)
+
+    # ── 会话标签页（D11）────────────────────────────────────────────────────
+    #
+    # 跟「当前会话」那个下拉框是**同一件事的两个入口**：下拉框是唯一的会话登记处，
+    # 标签页只是把「有自己独立窗口的会话」摊平了摆出来。两边永远同步——点标签页会
+    # 顺手把下拉框选过去（屏蔽信号，免得又走一遍 _on_chat_selected）。
+
+    def _clear_session_tabs(self):
+        """把标签页上的按钮全撤掉。**列表和布局一起清**，否则下一次重建会越堆越多。"""
+        layout = self.sessionTabs.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._tabButtons = []
+        self._tabTitles = []
+
+    def _owned_sessions(self):
+        """有自己独立窗口的会话名（保持下拉框里的顺序）。拿不到就返回空——宁可不显示。"""
+        if self.own_window_of is None:
+            return []
+        try:
+            titles = [self.chatBox.itemText(i) for i in range(self.chatBox.count())]
+            return [t for t in titles if t and self.own_window_of(t)]
+        except Exception:  # noqa: BLE001 —— 拿窗口状态失败不该让首页画不出来
+            return []
+
+    def _render_session_tabs(self):
+        """按「有自己独立窗口的会话」重建标签页；不够两个就把整行收起来。"""
+        self._clear_session_tabs()
+        owned = self._owned_sessions()
+        if len(owned) < 2:
+            self.sessionTabs.hide()
+            return
+        layout = self.sessionTabs.layout()
+        for title in owned:
+            button = PushButton(title)
+            button.setMinimumHeight(26)
+            button.setAccessibleName(f"查看会话「{title}」")
+            button.setToolTip("切到只看这个会话的记录和建议。微信那边不动，"
+                              "也不会改变它允不允许自动回复。")
+            button.clicked.connect(lambda _c=False, t=title: self._on_session_tab(t))
+            layout.addWidget(button)
+            self._tabButtons.append(button)
+            self._tabTitles.append(title)
+        layout.addStretch(1)
+        self._style_session_tabs()
+        self.sessionTabs.show()
+
+    def _style_session_tabs(self):
+        """当前正看着的那个会话高亮。**只改样式，不重建控件**——_switch_to 每次都调它。"""
+        for title, button in zip(self._tabTitles, self._tabButtons):
+            active = title == self._shown
+            bg = _GREEN if active else "#e8ede9"
+            fg = "#ffffff" if active else _MUTED
+            qss = (f"PushButton {{ background: {bg}; color: {fg}; border: none; "
+                   f"border-radius: 9px; padding: 5px 14px; font-weight: "
+                   f"{'600' if active else '400'}; }}"
+                   f"PushButton:hover {{ background: {bg}; }}")
+            setCustomStyleSheet(button, qss, qss)
+
+    def _on_session_tab(self, title):
+        """点标签页 = 只换悬浮窗在看谁（跟在下拉框里选一个等价），微信那边一个都不动。"""
+        if not title or title == self._shown:
+            return
+        index = self.chatBox.findText(title)
+        if index >= 0:
+            self.chatBox.blockSignals(True)
+            self.chatBox.setCurrentIndex(index)
+            self.chatBox.blockSignals(False)
+        self._switch_to(title)
 
     def set_targets(self, chat, senders, current):
         """某个会话的发言人名单（最近的在前）和当前回复对象；正看着它才重画。"""
@@ -2118,6 +2277,56 @@ class Overlay:
 
     def _follow_text(self):
         self.chatFollow.setText(("跟随微信" if self._shown == self._chat else "浏览中") if self._chat else "")
+
+    def _sync_auto_chat(self):
+        """把「允许自动回复」那一行对齐到当前会话。
+
+        只在「界面上这个会话有自己的独立窗口」时出现。主窗口（回退路径）的会话不出现——
+        那边走的是设置页里那三个全局开关，凭空多一个开关只会让老用户以为自己的设置被改了。
+        没有 own_window_of（离线工具构造的 Overlay）时整行永远不出现，跟加这个功能之前一样。
+        """
+        if self.own_window_of is None:
+            self.autoChatRow.hide()
+            return
+        title = self._shown
+        if not title or not self.own_window_of(title):
+            self.autoChatRow.hide()
+            return
+        allowed = settings.auto_chat(title)
+        self.autoChatSwitch.blockSignals(True)
+        self.autoChatSwitch.setChecked(allowed)
+        self.autoChatSwitch.blockSignals(False)
+        if allowed:
+            # 授权只是一层，全局那三个开关是另一层。**两层都开才会真发**——
+            # 只说「已允许」会让用户以为搞定了，然后等一个永远不来的自动回复。
+            self.autoChatNote.setText(
+                "" if settings.auto_send_on()
+                else "已允许，但设置页里那三个开关都关着，还是不会自动发")
+        else:
+            self.autoChatNote.setText("新窗口默认不允许；开了它才可能自动发（还要配合设置页那三个开关）")
+        self.autoChatRow.show()
+
+    def refresh_windows(self):
+        """窗口增删之后由 main 叫一声：三处要跟着变。
+
+        1. 首页那一行「允许自动回复」的显隐（它只对独立窗口的会话出现）；
+        2. 会话标签页的增删（不够两个独立窗口时整行收起来）；
+        3. 知识库窗口那栏「当前看到的窗口」——那个窗口开着才重画，没开就别白建一遍。
+        """
+        self._sync_auto_chat()
+        self._render_session_tabs()   # 独立窗口增删 → 标签页跟着增删
+        if self.kbWindow is not None and self.kbWindow.isVisible():
+            self.kbWindow.refresh()
+
+    def _on_auto_chat_toggled(self, on):
+        """用户拨了「允许自动回复」。持久化交给 main（跟标题栏那个「判断」开关一个道理）。"""
+        title = self._shown
+        if not title:
+            return
+        if self.on_auto_chat_change:
+            self.on_auto_chat_change(title, bool(on))
+        self._sync_auto_chat()
+        self.set_status(f"「{title}」{'允许' if on else '不允许'}自动回复。", "success")
 
     def show_cached(self, result):
         """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——

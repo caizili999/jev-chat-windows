@@ -17,8 +17,7 @@ import threading
 import traceback
 from collections import deque
 
-from app import recorder, settings, update, worker
-from app.capture import find_wechat_hwnd
+from app import focus, recorder, settings, update, windows as W, worker
 from app.fill import fill, send_text
 from app.kb import KbStore
 from app.kb.context import as_knowledge
@@ -34,12 +33,35 @@ from core.jev_client import JevError
 # senders：这个群里发过言的人，去重、最近的排最前；target：用户挑的回复对象（None = 跟着最近那个走）
 # auto：这一轮生成是不是「对方来了新消息」触发的——用户自己要求重生成时置 False，那种不自动发送
 chats = {}
-state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
-         # 自动发送相关的状态。input_has：子进程报来的「输入框里有没有字」，None = 还不知道；
-         # batches：每个会话见过几批消息，第一批可能是攒下的存量，不自动发（见 start_auto）；
-         # auto_title：正在倒计时的那个会话名，发送前要用它再确认一次微信没被切走；
-         # quiet：{会话名: 令牌}，这个会话正排着一个「等群里安静下来」的定时器（见 arm_quiet）
-         "input_has": None, "batches": {}, "auto_title": "", "quiet": {}}
+# 状态分三层，**「单值 → 按会话」这件事就体现在 wins / input_has / rerun 三个键上**：
+#
+#   全局（只有一个）
+#     busy       一次只跑一个分析——模型调用不并行，也不该并行（钱和节奏都受不了）
+#     auto_title 正在倒计时的会话名。overlay 的倒计时是**单例**（一个 _autoTimer / 一个
+#                _autoText，第二次 begin_auto 会顶掉第一次），所以这里也只能是单值——
+#                换成 dict 反而会跟界面对不上（见 auto_send_reply 的注释）
+#   按会话
+#     wins       {会话名: {"hwnd", "area", "is_main"}}——这个会话在哪个窗口、消息区在哪。
+#                原来是一个 state["hwnd"] + 一个 state["area"]；多独立窗口下必须按会话，
+#                否则第二个窗口会把第一个的坐标顶掉，往错窗口填字
+#     input_has  {会话名: bool}——输入框里有没有字。按窗口算的，所以按会话
+#     rerun      {会话名: (title, msgs, auto_ok)}——分析期间又来了新消息，排队等这一轮跑完。
+#                原来只有一个槽，第二个会话的会顶掉第一个（三个群同时来消息就丢两个）
+#     batches    {会话名: 批次数}
+#     quiet      {会话名: 令牌}
+#     auto_queue {会话名: (待发文本, 为什么发这句)}——已经有别的会话在倒计时了，这一条先排着。
+#                **同一个会话不排队**（那是新结果，直接顶掉旧的那条倒计时，见 start_auto）；
+#                不同会话才排——`fill()` 要抢前台，两条倒计时同时到点必然打架，
+#                所以一次只发一个（设计文档 D9/D10）
+#   主窗口（回退路径）
+#     chat       主窗口现在显示哪个会话。**只有「没有独立窗口」时它才有意义**——
+#                那时它就是唯一的会话，所有老行为都靠它保持逐字节不变。
+#                独立窗口钉住自己的会话、不会换，所以它们不需要这个游标
+state = {"busy": False, "auto_title": "", "wins": {}, "input_has": {}, "rerun": {},
+         "batches": {}, "quiet": {}, "chat": "", "auto_queue": {},
+         # 正在跑的那一轮分析属于哪个会话。用来判断「这一轮忙的指示该不该收」
+         # （按会话收，否则 A 说完了会把 B 正在跑的「正在整理…」也收掉）
+         "analyzing": ""}
 # 聊天记录导出器。开关关着时是 None——不建它，连去重窗口都不占内存。
 # 它跟分析、自动发送完全并行：那边一行都不读它，它写盘失败也绝不往外抛。
 history_rec = None
@@ -48,6 +70,8 @@ history_rec = None
 # 发出去的请求跟以前一个字节都不差。
 kb_store = None
 _self_judge_noticed = False  # 自判模式只提示一次，别每轮都刷状态栏
+# 已经提示过「这个窗口还没配到联系人」的窗口标题。**每个标题只说一次**，不唠叨。
+_unpaired_warned = set()
 _PHASE_TEXT = {"draft": "正在起草候选回复…", "judge": "正在判断和排序…"}
 results = queue.Queue()
 phase_q = queue.Queue()  # 生成进度。跟 results 分开：那边是定长的 5 元组，混进来会拆包失败
@@ -67,29 +91,136 @@ def target_of(title):
     return chat["senders"][0] if chat["senders"] else None
 
 
+def win_of(title):
+    """这个会话在哪个窗口、消息区在哪。没有 = 这个会话现在没有可见的窗口。"""
+    return state["wins"].get(title)
+
+
+def showing(title):
+    """这个会话现在是不是还显示在某个窗口上。**自动发送前要拿它再确认一次**。
+
+    - 独立窗口：钉住一个会话，窗口还在（wins 里有它）就是显示着；
+    - 主窗口：会换会话，得看它现在显示的正好是不是这个。
+
+    没有独立窗口时它就等价于老代码的 `state["chat"] == title`——回退路径逐字节不变。
+    """
+    w = state["wins"].get(title)
+    if w is None:
+        return False
+    return not w["is_main"] or state["chat"] == title
+
+
+def _has_own_window(title):
+    """这个会话是不是有自己的独立窗口（不是靠主窗口那个回退）。"""
+    w = win_of(title)
+    return w is not None and not w["is_main"]
+
+
+def _warn_unpaired_window(title):
+    """独立窗口的标题跟知识库联系人一个都对不上时，**非模态**说一句。
+
+    这是「会话名从 OCR 头部改成 Windows 窗口标题」的必然后果（见
+    docs/DESIGN_MULTIWINDOW.md §6.2）：窗口标题跟现有联系人一个都对不上——
+    `1群` vs `1群(4)Q`（那个 Q 是 OCR 把 🔍 认成的字）、
+    `程序员烧烤🦞技术交流群v3.0` vs `程序员烧烤技术交流群v3.0`（存的时候 🦞 丢了）。
+    不配一次，那几十上百条历史会**静默**对不上，首页只是从「用了知识库」变成
+    「本轮未使用知识库」，用户只会以为功能坏了。
+
+    ⚠️ **必须非模态**（InfoBar，浮一下就走）。调用它的是 tick() 那条主循环，
+    而 `ov.after(50, tick)` 是 tick() 的**最后一行**——在 tick() 里弹模态框
+    （`kb_ui.confirm()` → `MessageBoxBase.exec()`）会让父进程彻底停死（§6.3）。
+
+    三个前提，缺一不说：
+      - 是**独立窗口**（主窗口那条路的名字还是 OCR 来的，老用户不受影响）；
+      - 有知识库（没有 store 就没有「配到联系人」这回事，说了也没地方配）；
+      - 这个标题**还没说过**（每个标题只说一次，别每轮都刷）。
+    """
+    if not title or kb_store is None or title in _unpaired_warned:
+        return
+    _unpaired_warned.add(title)
+    try:
+        if kb_store.find_contact(title, "wechat") is None:
+            ov.notify_unpaired(title)
+    except Exception:  # noqa: BLE001 —— 提示不出来不是故障，绝不能拖垮采集
+        pass
+
+
+def _next_rerun():
+    """排着队的「等这一轮跑完再跑」里，最早排的那条。dict 保序，所以取第一个键就行。
+
+    每个会话最多排一条（`state["rerun"][title] = …` 会覆盖同一个会话的旧那条）：
+    连着来十条消息只需要跑最后一次，中间那些的上下文已经被后面的包进去了。
+    """
+    if not state["rerun"]:
+        return None
+    title = next(iter(state["rerun"]))
+    return state["rerun"].pop(title)
+
+
+def _win_area(hwnd):
+    """同一个窗口上别的会话记着的消息区。
+
+    为什么要继承：主窗口换会话时子进程的 `last_area` 是按**窗口**记的、没变，
+    它不会再发一次 `("area", …)`，新会话的坐标就得从旧会话那儿拿——不然 `fill_reply`
+    会对着一个刚切过去的会话说「输入区域尚不可用」。
+    """
+    for w in state["wins"].values():
+        if w["hwnd"] == hwnd and w["area"] is not None:
+            return w["area"]
+    return None
+
+
 def fill_reply(text):
-    if state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
+    """把候选填进微信输入框。**填哪个窗口**由界面上正看着的会话决定——多独立窗口下
+    每个会话有自己的窗口，这里不能猜：猜错就是把回复打到别人那儿去。"""
+    title = ov.current_chat()
+    w = win_of(title)
+    if w is None:
         raise RuntimeError("未找到微信窗口，请确认微信已打开")
-    if state["area"] is None:
+    if w["area"] is None:
         raise RuntimeError("微信输入区域尚不可用，请确认微信聊天窗口可见（不要最小化）")
     if settings.reply_target() and ov.at_prefix_enabled():
-        target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
+        target = target_of(title)  # 填进去的是界面上正看着的那个会话的对象
         if target:
             text = f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
-    fill(state["hwnd"], state["area"], text)
+    fill(w["hwnd"], w["area"], text)
+
+
+def _wechat_present():
+    """屏幕上有没有能盯的微信窗口。
+
+    判据比「有聊天窗口」宽松，跟老代码对齐：**只要有一个可见的微信顶层窗口**就开采集，
+    挑不出聊天窗口是后面 chat_area 的事（老代码就是这么挑的，也是这么失败的）。
+    """
+    try:
+        t = W.discover()
+    except Exception as e:  # noqa: BLE001 —— 枚举失败当「没找到」，让用户再点一次开关
+        ov.log(f"[窗口] 枚举失败：{type(e).__name__}: {e}")
+        return False
+    return bool(t["windows"]) or t["fallback"] is not None
 
 
 def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。
 
+    子进程**自己发现窗口**（见 app/windows.py），所以这里不再传 hwnd——这是多独立窗口的
+    前提：窗口是用户随时开随时关的，父进程不能在启动时定死一个。
+
     watch_input 跟着「自动发送有没有开」走：没开的人不该白付这份输入框检测的计算。
-    batches 一并清空——新子进程的去重状态是空的，它报上来的第一批全是「它第一次见」，
-    不能拿旧计数当成「这个会话我已经熟了」。等安静那批定时器同理，一并作废。
+    下面这几个都一并清空——新子进程的去重状态是空的，它报上来的第一批全是「它第一次见」，
+    不能拿旧计数当成「这个会话我已经熟了」；wins 里留着的旧 hwnd 更危险（可能已经失效），
+    宁可等它重新报一遍（最多 1 秒），也不要往一个可能已经没了的窗口填字。
     """
     state["batches"].clear()
     state["quiet"].clear()
+    state["rerun"].clear()
+    state["input_has"].clear()
+    state["wins"].clear()
+    state["auto_queue"].clear()
+    state["auto_title"] = ""
+    state["chat"] = ""
     p = multiprocessing.Process(target=worker.run,
-                                args=(q, state["hwnd"], capture_on, watch_input), daemon=True)
+                                args=(q, capture_on, watch_input), daemon=True)
     p.start()
     return p
 
@@ -101,9 +232,7 @@ def on_toggle_capture(on):
         capture_on.clear()
         return
     if child is None:
-        try:
-            state["hwnd"] = find_wechat_hwnd()
-        except RuntimeError:
+        if not _wechat_present():
             ov.set_capture(False, "未找到微信窗口，打开微信后再开启采集")
             return
         child = spawn_worker()
@@ -201,6 +330,7 @@ def start_analyze(title, msgs, auto_ok=False):
     # 只有真要调模型了才建。返回值是 None 时整条链跟加这个功能之前完全一致。
     knowledge = build_knowledge(title, msgs)
     state["busy"] = True
+    state["analyzing"] = title  # 这一轮忙的是谁——收 busy 指示时要按会话对
     ov.set_busy(True)
     # 这一轮该不该考虑自动发送。记在会话上而不是结果里：结果是从线程回来的，多带一个字段
     # 会让那条定长元组（kind, r, title, revision, info）到处都要改。
@@ -228,7 +358,7 @@ def on_target_change(title, name):
     if not any(m[0] == "her" for m in msgs):
         return
     if state["busy"]:
-        state["rerun"] = (title, msgs, False)
+        state["rerun"][title] = (title, msgs, False)
         ov.set_busy(True)
     else:
         # 用户自己要求重生成，不是对方来了新消息——这一轮不自动发送。否则他一改回复对象，
@@ -246,7 +376,7 @@ def sync_watch_input():
         watch_input.set()
     else:
         watch_input.clear()
-        state["input_has"] = None
+        state["input_has"].clear()
 
 
 def sync_history():
@@ -265,6 +395,31 @@ def sync_history():
         for line in history_rec.take_problems():
             ov.log(f"[聊天记录] {line}")
         history_rec = None
+
+
+def own_windows():
+    """现在屏幕上开着的独立聊天窗口标题（给知识库窗口那栏「当前看到的窗口」配对用）。
+
+    只列**独立窗口**：主窗口的会话名是 OCR 来的，跟窗口标题（永远是「微信」）无关，
+    拿它去配对只会把「微信」写进某个联系人的别名里。
+    """
+    return [t for t, w in state["wins"].items() if not w["is_main"]]
+
+
+def on_auto_chat_change(title, on):
+    """用户拨了首页那个「允许自动回复」。
+
+    只写这一个键（`settings.save_auto_chat` 直接改文件），不走 `save()`——从一个开关去拼
+    一整套当前值是极容易漏项的，漏了就等于把用户别的设置清成默认。
+
+    授权只是一层、全局那三个开关是另一层，**两层都开才会真发**。用户只拨了这一层时
+    必须说一句，否则他会等一个永远不来的自动回复，然后以为功能坏了。
+    """
+    settings.save_auto_chat(title, on)
+    if on and not settings.auto_send_on():
+        ov.log(f"[自动发送] 「{title}」已允许，但设置页里那三个开关都关着，现在还是不会自动发。")
+    else:
+        ov.log(f"[自动发送] 「{title}」{'允许' if on else '不允许'}自动回复。")
 
 
 def on_settings_change():
@@ -342,10 +497,29 @@ def fire_quiet(title, token):
         return
     msgs = list(chat["history"])
     if state["busy"]:
-        state["rerun"] = (title, msgs, True)
+        state["rerun"][title] = (title, msgs, True)
         ov.set_busy(True)
     else:
         start_analyze(title, msgs, auto_ok=True)
+
+
+def auto_allowed(title):
+    """（界面这一侧 + 授权）放不放行自动发送。
+
+    - **主窗口（回退路径）**：老行为一字不改——`ov.can_auto_send()`，也就是
+      「界面上正看着的必须就是微信当前会话」。单窗口时代这是防「往错会话发」的闸。
+      这一条**刻意不叠按会话授权**：没有独立窗口的老用户行为必须逐字节不变。
+    - **独立窗口**：要求这个会话被**逐个授权**（新窗口默认关，见 settings.auto_chat）。
+      授权之后不再要求「界面上正看着它」——每个窗口钉住自己的会话，「往错窗口发」在物理上
+      不可能发生，而用户要的正是「三个会话都自动回」。真正的闸在 auto_send_reply 里：
+      按会话查窗口 + 重读窗口标题。
+    """
+    w = win_of(title)
+    if w is None:
+        return False
+    if not w["is_main"]:
+        return settings.auto_chat(title)
+    return ov.can_auto_send()
 
 
 def start_auto(title, result):
@@ -359,7 +533,8 @@ def start_auto(title, result):
        前的消息，比不回复糟得多。等这个会话再来了新消息，才进自动发送的射程。
     4. auto_pick()：单聊 / 群里 @我 / 群里不@我也回 三个开关、群里有没有 @我、群昵称填没填。
        判断关着时它会给第一条候选和一句说明，不算拦截。
-    5. 界面上正看着的必须是微信当前会话，否则候选是「只看不填」的，更不该发。
+    5. 界面这一侧放不放行（见 auto_allowed）——主窗口时是「正看着的必须是当前会话」，
+       独立窗口时不看这条（它钉住自己的会话，不存在「发错会话」）。
 
     **每一条拦截都要出现在状态栏**，不能只写进「聊天记录」面板——那个面板默认折叠，用户开了
     自动发送却没发出去时，第一反应就是「怎么没反应」。原因写在日志里等于没写。
@@ -384,9 +559,17 @@ def start_auto(title, result):
         kind = "warning" if note in AUTO_CONFIG_REASONS else "idle"
         ov.set_status(f"自动发送：没发（{note}）。", kind)
         return
-    if not ov.can_auto_send():
-        ov.log("[自动发送] 没发：界面上正看着的不是微信当前会话。")
-        ov.set_status("自动发送：没发（界面上正看着别的会话）。", "warning")
+    if not auto_allowed(title):
+        w = win_of(title)
+        if w is not None and not w["is_main"]:
+            # 独立窗口没发出去，**多半是没授权**（新窗口默认关）。这条必须说破，
+            # 而且要说清去哪儿开——否则用户只会觉得「这个功能在独立窗口上不工作」。
+            ov.log(f"[自动发送] 没发：「{title}」还没授权自动回复。"
+                   "在首页会话选择框旁边那个「允许自动回复」开关上打开它。")
+            ov.set_status(f"自动发送：没发（「{title}」还没授权）。", "warning")
+        else:
+            ov.log("[自动发送] 没发：界面上正看着的不是微信当前会话。")
+            ov.set_status("自动发送：没发（界面上正看着别的会话）。", "warning")
         return
     # 倒计时三条路共用一个值（「生成完等几秒再发」）：节奏已经由安静窗口负责压住了，
     # 再给这条路叠一层更长的倒计时，只会让用户对不上自己在设置页填的那个数。
@@ -396,19 +579,63 @@ def start_auto(title, result):
     if unasked:
         note = (note + " " if note else "") + "这条没@你，是「群里不@我也回」触发的。"
     delay = settings.auto_send_delay()
-    state["auto_title"] = title
+    text = result["candidates"][index]
     # note 是「这次为什么发这条」——判断关着时它是「没有判断结果，直接发第一条」，
     # 会显示在倒计时条上。用户以为发的是「判断过的推荐」，不写出来他永远不会知道。
-    ov.begin_auto(result["candidates"][index], delay, note)
+    if ov.auto_pending() and state["auto_title"] != title:
+        # 已经有**别的**会话在倒计时了 → 排队，等它发完再摆出来。
+        # 为什么必须排：`fill()` 要抢前台、点输入框、按发送键，两条倒计时同时到点必然打架，
+        # 打输的那条可能把字打进赢的那个窗口里——那是往错的会话发消息。
+        #
+        # **同一个会话不排队，直接顶掉**：那说明这一轮的结果比正在倒计时的更新
+        # （同一个会话又来了新消息），排上去会先发一条已经过期的、再发一条新的。
+        # 老代码就是这个「顶掉」行为，回退路径因此一个字都没变。
+        state["auto_queue"][title] = (text, note)
+        ov.log(f"[自动发送] 「{title}」排在「{state['auto_title']}」后面，等它发完再发。")
+        ov.set_status(f"自动发送：「{title}」排队中（一次只发一个）。", "busy")
+        return
+    # auto_title 是**单值**，不是按会话的 dict：overlay 的倒计时本来就是单例
+    # （一个 _autoTimer、一个 _autoText，第二次 begin_auto 会把第一次顶掉），
+    # 所以「谁正在倒计时」同一时刻只可能有一个。换成 dict 反而会跟界面对不上——
+    # 界面那边只有一个 _autoText，dict 里却能躺着好几条，`_auto_fire` 该拿哪条？
+    state["auto_title"] = title
+    ov.begin_auto(text, delay, note)
+
+
+def pump_auto_queue():
+    """倒计时空下来了，就把排着队的下一个摆出来。由 tick() 每 50ms 叫一次。
+
+    为什么用「轮询」而不是在发送/取消的地方回调：取消有三条路（用户点取消、输入框里有字、
+    会话被切走），每一条都要挂一个「发下一条」的钩子，漏一条队列就永远卡住。
+    轮询只有一处，卡不住。
+    """
+    if ov.auto_pending():
+        return
+    while state["auto_queue"]:
+        title = next(iter(state["auto_queue"]))  # dict 保序：先来先发
+        text, note = state["auto_queue"].pop(title)
+        if not showing(title) or not auto_allowed(title):
+            # 排队期间那个窗口关了 / 授权被收回了 → 直接丢掉。
+            # 别「等它回来再发」：等回来的时候这条回复早就过期了。
+            ov.log(f"[自动发送] 「{title}」排队期间已经不能发了，丢掉这一条。")
+            continue
+        state["auto_title"] = title
+        ov.begin_auto(text, settings.auto_send_delay(), note)
+        ov.log(f"[自动发送] 轮到「{title}」了。")
+        return
 
 
 def auto_send_reply(text):
     """倒计时走完，真的按发送键。**这里是最后一道闸**。
 
-    倒计时那几秒里什么都可能变：微信被切到别的会话、用户自己在输入框里打了字、采集停了。
+    倒计时那几秒里什么都可能变：窗口被关了、用户自己在输入框里打了字、采集停了。
     任何一个成立都取消这次发送，并把原因说清楚——方向永远是「不发」，因为发出去收不回来。
+
+    会话名从 `state["auto_title"]` 取（不是从参数来）：倒计时是单例，这个值必然就是
+    正在倒计时的那个会话，跟 overlay 手里那条 _autoText 一一对应。
     """
     title = state["auto_title"]
+    w = win_of(title) if title else None
     reason = ""
     if not title:
         # 理论上到不了这儿（start_auto 一定会先写 auto_title）。真到了就说明有 bug——
@@ -416,22 +643,45 @@ def auto_send_reply(text):
         reason = "不知道这条回复属于哪个会话"
     elif state["busy"]:
         reason = "又在生成新的回复了"
-    elif state["chat"] != title:
+    elif w is None:
+        # 这个会话的窗口没了（关掉了 / 不再是聊天窗）。**主窗口时代到不了这里**——
+        # 那时 hwnd 是启动时定死的、不会消失，窗口真没了走的是 "dead"。
+        reason = "这个会话的窗口已经不在了"
+    elif w["is_main"] and state["chat"] != title:
+        # 主窗口（回退路径）独有的老闸：微信切到别的会话了。
+        # 独立窗口不走这条——它钉住自己的会话，不存在「切走」这回事。
         reason = "微信已经切到别的会话"
-    elif ov.current_chat() != title:
+    elif w["is_main"] and ov.current_chat() != title:
+        # 同上，另一道老闸：界面上正看着的必须就是它
         reason = "界面已经切到别的会话"
-    elif state["hwnd"] is None or state["area"] is None:
+    elif w["area"] is None:
         reason = "微信窗口或输入区域不可用"
-    elif state["input_has"] is not False:
+    elif state["input_has"].get(title) is not False:
         # 子进程 0.25 秒查一次，所以这个判断最多滞后 0.25 秒。够用了：用户真在打字的话，
         # 子进程几乎立刻会报上来，而倒计时本身还给了他几秒可以点取消。
         reason = "输入框里已经有内容了"
+    elif not w["is_main"]:
+        # ── 下面三条**只对独立窗口生效**（设计文档 §7 的 1/2/5 条）──
+        # 主窗口（回退路径）不走这几条：没有独立窗口的老用户行为必须逐字节不变。
+        # 而且这几条在新路上确实必要——句柄是 ~1 秒前报上来的，这中间什么都可能发生。
+        if not W.alive(w["hwnd"]):
+            reason = "那个窗口已经关掉了"
+        elif W.normalize_title(W.title_of(w["hwnd"])) != W.normalize_title(title):
+            # **「往错群发消息」的唯一防线**：句柄还在，但那个窗口已经不是这个会话了
+            # （独立窗口被关掉之后微信把同一个 hwnd 复用给了别的会话，或者用户改了群名）。
+            # 光看「句柄还有效」是不够的，必须把标题读回来跟生成候选时的会话名对一遍。
+            reason = "那个窗口已经换成别的会话了"
+        elif not focus.user_is_away():
+            # fill() 要抢前台 + 挪鼠标。人正坐在电脑前时那一抢就是打扰（他可能正在别的
+            # 窗口里打字，焦点被夺走的那几个字就打飞了）。这一条恰好把自动发送限定在
+            # 「真的需要它」的场景：你在，就你自己发；你走开了，它才替你发。
+            reason = f"你刚动过键盘或鼠标（{int(focus.USER_IDLE_SECONDS)} 秒内），不抢你的焦点"
     if reason:
         ov.set_status(f"已取消自动发送（{reason}），回复还在候选里。", "warning")
         ov.log(f"[自动发送] 取消：{reason}。")
         return
     try:
-        pressed = send_text(state["hwnd"], state["area"], text, settings.send_key())
+        pressed = send_text(w["hwnd"], w["area"], text, settings.send_key())
     except Exception as e:
         ov.set_status("自动发送失败，回复还在候选里，请手动确认。", "error")
         ov.log(f"[自动发送失败] {type(e).__name__}: {e}")
@@ -455,7 +705,7 @@ def check_auto_sent(title):
     「框里临时有字」的状态它可能采到、也可能采不到；但只要有后续变化它就会再报一次，
     2.5 秒之后拿到的必然是稳定值。所以不会因为那个瞬时状态误报。
     """
-    if state["chat"] != title or state["input_has"] is not True:
+    if not showing(title) or state["input_has"].get(title) is not True:
         return
     ov.set_status("自动发送可能没成功：输入框里还有内容。请检查微信「设置 → 通用 → 快捷键」"
                   "里的发送键，跟设置页里选的那个保持一致。", "warning")
@@ -472,11 +722,53 @@ def drain():
             return
         kind = msg[0]
         if kind == "area":  # 只是窗口挪了位置，坐标跟着更新，别的什么都不用动
-            state["area"] = msg[1]
+            _, title, rect = msg
+            w = win_of(title)
+            if w is not None:
+                w["area"] = rect
             continue
-        if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
-            state["chat"] = msg[1]
-            ov.set_chat(msg[1])
+        if kind == "session":
+            # 某个窗口现在显示这个会话（第一次见到 / 主窗口换了会话）。
+            # is_main 分两条路：主窗口会换会话（跟老行为一致），独立窗口钉住一个会话。
+            _, hwnd, title, is_main = msg
+            if is_main:
+                if title and title != state["chat"]:
+                    # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）。
+                    # 空标题是「还没 OCR 出来」的占位，别拿它去切界面。
+                    ov.set_chat(title)
+                state["chat"] = title
+            if title:
+                w = win_of(title)
+                if w is None or w["hwnd"] != hwnd:
+                    # 同一个窗口上别的会话记着的坐标可以继承（见 _win_area）
+                    state["wins"][title] = {"hwnd": hwnd, "area": _win_area(hwnd),
+                                            "is_main": bool(is_main)}
+                if not is_main:
+                    # 新窗口出现时切过去看一眼——但**只在界面上还没在看任何会话时**。
+                    # S6 有了会话标签页之后就不该再抢视图了：每发现一个窗口就切一次，
+                    # 结果是「开三个窗口、界面停在最后一个」，用户反而找不到东西；
+                    # 「现在盯的是哪几个」已经由标签页摆在那儿了。
+                    if not ov.current_chat():
+                        ov.set_chat(title)
+                    _warn_unpaired_window(title)
+            ov.refresh_windows()  # 窗口集合变了，首页那个「允许自动回复」的显隐跟着变
+            continue
+        if kind == "gone":
+            # 某个窗口没了（关掉了 / 收起来了 / 不再是聊天窗）
+            _, hwnd = msg
+            was_main = False
+            for t, w in list(state["wins"].items()):
+                if w["hwnd"] == hwnd:
+                    was_main = was_main or w["is_main"]
+                    del state["wins"][t]
+                    state["auto_queue"].pop(t, None)  # 排着队的也一起丢掉，别等它回来
+                    if state["auto_title"] == t:
+                        # 正在倒计时的那个窗口被关了：收掉，别让它到点往一个没了的窗口按发送键
+                        ov.cancel_auto("那个窗口已经关掉了，已取消这次自动发送。")
+                        state["auto_title"] = ""
+            if was_main:
+                state["chat"] = ""
+            ov.refresh_windows()
             continue
         if kind == "status":  # 单帧识别失败/报错，提示一下就好，别把正在跑的分析和已知坐标清掉
             ov.set_status(msg[1], "warning")
@@ -489,18 +781,23 @@ def drain():
             ov.set_capture(True)
             continue
         if kind == "input":  # 子进程报来「输入框里有没有字」（只在状态变了才报）
-            state["input_has"] = msg[1]
-            if msg[1] and ov.auto_pending():
+            _, title, has = msg
+            state["input_has"][title] = has
+            if has and ov.auto_pending() and state["auto_title"] == title:
                 # 用户已经在输入框里打字了，这是「他要自己回」最强的信号。不必等倒计时走完
                 # 再拒绝，当场收掉并说清为什么——他正低头打字，状态栏那句话就在他眼前。
+                # 只对**正在倒计时的那个会话**动手：别的会话里打字不该影响这一条。
                 ov.cancel_auto("输入框里已经有内容（你可能正在打字），已取消这次自动发送。")
             continue
         if kind == "dead":  # 采集彻底停了（微信关了之类），这才是真的要清状态
-            state["area"] = None
+            state["wins"].clear()
+            state["chat"] = ""
             for c in chats.values():  # 在跑的分析作废，回来的结果不再往界面上贴
                 c["rev"] += 1
-            state["rerun"] = None
+            state["rerun"].clear()
             state["quiet"].clear()  # 采集都停了，等着的那批定时器也没意义了
+            state["auto_queue"].clear()  # 排着队的那些也发不出去了（窗口都没了）
+            state["auto_title"] = ""
             ov.invalidate_replies()
             ov.set_busy(False)
             ov.set_capture(False, msg[1])
@@ -511,7 +808,9 @@ def drain():
                 child = None
             continue
         _, title, new, area = msg
-        state["area"] = area
+        w = win_of(title)
+        if w is not None and area is not None:
+            w["area"] = area
         chat = chat_of(title)
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
         # 见了几批。第一批可能是攒下的存量（启动时屏幕上就有的、刚切过去的会话里的历史），
@@ -519,6 +818,11 @@ def drain():
         state["batches"][title] = state["batches"].get(title, 0) + 1
         if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
             ov.invalidate_replies()
+        elif state["auto_title"] == title:
+            # 这个会话又来了新消息，而它正排着一条自动发送。界面那边没在看着它、
+            # 所以上面那句 invalidate_replies() 没走到——但那条倒计时发的是**上一轮**的回复，
+            # 现在按下去就是答非所问。当场收掉。
+            ov.cancel_auto("这个会话又来了新消息，已取消上一次的自动发送。")
         for who, name, text, _ts in new:
             chat["history"].append((who, text, name))
             ov.log_message(who, text, name, chat=title)
@@ -540,14 +844,17 @@ def drain():
             else:
                 msgs = list(chat["history"])
                 if state["busy"]:
-                    state["rerun"] = (title, msgs, True)
+                    state["rerun"][title] = (title, msgs, True)
                     ov.set_busy(True)
                 else:
                     start_analyze(title, msgs, auto_ok=True)
         else:
             state["quiet"].pop(title, None)  # 自己说话了，没什么可等的了
-            state["rerun"] = None
-            ov.set_busy(False)
+            state["rerun"].pop(title, None)
+            if state["analyzing"] == title:
+                # 正在跑的那一轮就是这个会话的 → 它已经过期了，忙的指示也该收。
+                # 别的会话正在跑就别动它（回退路径下这两者必然一致，所以老行为不变）
+                ov.set_busy(False)
             ov.set_status("你已回复，等待对方的新消息")
 
 
@@ -615,11 +922,17 @@ def tick():
         while not update_result.empty():
             latest, url = update_result.get()
             ov.set_update(latest, url)
+        # 倒计时空下来了就摆出排着队的下一条（一次只发一个，见 pump_auto_queue）
+        pump_auto_queue()
         while not results.empty():
             kind, r, title, revision, info = results.get()
             state["busy"] = False
-            if state["rerun"]:  # 分析期间又来了新消息，接着跑最新的
-                (t, msgs, auto_ok), state["rerun"] = state["rerun"], None
+            # 分析期间又来了新消息，接着跑最新的。**按会话排队**（原来只有一个槽，
+            # 三个群同时来消息时第二个会把第一个顶掉、那个会话就再也不生成了）：
+            # 先看是不是这个会话自己排的那条，不是就挑最早排的那条。
+            pending = state["rerun"].pop(title, None) or _next_rerun()
+            if pending:
+                t, msgs, auto_ok = pending
                 start_analyze(t, msgs, auto_ok)
                 continue
             if revision != chat_of(title)["rev"]:  # 这个会话后来又说话了，这份结果过期了
@@ -627,15 +940,21 @@ def tick():
                 continue
             if kind == "ok":
                 chat_of(title)["result"] = r  # 先存着；正看着这个会话才立刻贴上去
-                if title == ov.current_chat():
+                shown = title == ov.current_chat()
+                if shown:
                     ov.show(r)
                     # 判断失败但候选保住了：完整原因进面板，状态栏那句由 show() 给
                     if r.get("judge_error"):
                         ov.log(r["judge_error"].get("message") or "判断失败")
                     notice_self_judge(r)
-                    start_auto(title, r)  # 该自动发送就在这里把倒计时摆出来
                 else:
                     ov.set_busy(False)
+                # 该自动发送就在这里把倒计时摆出来。
+                # 老行为是「只有界面上正看着这个会话才考虑自动发送」——回退路径照旧；
+                # 独立窗口不受这条限制：它的候选可能一直不在界面上（用户在看别的窗口），
+                # 而那正是用户要的「三个会话都自动发」（真正的闸在 auto_allowed 里）。
+                if shown or _has_own_window(title):
+                    start_auto(title, r)
             else:
                 # 先写日志再收尾：set_failed 会把聊天记录面板展开，用户看到的第一行就是原因
                 ov.log(r)
@@ -661,17 +980,20 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  result_of=lambda t: chats.get(t, {}).get("result"),
                  on_auto_send=auto_send_reply, on_settings_change=on_settings_change,
                  on_toggle_judge=on_toggle_judge,
+                 on_auto_chat_change=on_auto_chat_change, own_window_of=_has_own_window,
+                 windows_of=own_windows,
                  kb=kb_store, on_kb_change=on_kb_change)
     child = None
     sync_watch_input()  # 上次是开着自动发送的话，这次一启动就盯上
     sync_history()  # 上次开着聊天记录的话，这次一启动就接着记
-    try:
-        state["hwnd"] = find_wechat_hwnd()
-    except RuntimeError:
-        ov.set_capture(False, "未找到微信窗口，打开微信后再开启采集")
-    else:
+    # 启动时只要屏幕上有可见的微信窗口就开采集。**这里刻意不问「有没有聊天窗口」**：
+    # 挑不出聊天窗口是子进程后面 chat_area() 的事（老代码也是这么失败的），
+    # 拿它当启动条件会把「微信收在托盘里」的老用户从「采集着但认不出」变成「压根没启动」。
+    if _wechat_present():
         capture_on.set()
         child = spawn_worker()
+    else:
+        ov.set_capture(False, "未找到微信窗口，打开微信后再开启采集")
     # 只有「起草都跑不起来」才把设置页顶到用户脸上。缺 OpenRouter 密钥不算——
     # 那是起草模式，能干活，别拿一个可选的东西拦人。
     if settings.draft_problem():

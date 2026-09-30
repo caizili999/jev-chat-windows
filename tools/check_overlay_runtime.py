@@ -415,6 +415,128 @@ def check_config_problem_reaches_ui(ov) -> None:
     print("坏配置告警真的到了界面上 ok")
 
 
+def check_auto_chat_row(path: str) -> None:
+    """首页那行「允许自动回复」：只对**独立窗口**的会话出现，开关状态跟着那个会话走。
+
+    守两件事：
+    1. 主窗口（回退路径）的会话**不许**出现这一行——凭空多一个开关会让老用户以为自己的
+       设置被改了。那边的判据是设置页里那三个全局开关，一个字都没变（这是本项目最硬的约束）。
+    2. 拨了开关要把「哪个会话、开还是关」原样交给 main（持久化只有那一条路，跟标题栏那个
+       「判断」开关一个道理），而且**重画之后开关要停在新状态上**——不然用户会以为没生效。
+    """
+    from app import settings as st
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"relationship": "朋友"}, f, ensure_ascii=False)
+
+    changed = []
+    ov = Overlay(on_fill=lambda *a: None,
+                 own_window_of=lambda t: t == "1群",
+                 on_auto_chat_change=lambda t, on: (changed.append((t, on)),
+                                                    st.save_auto_chat(t, on)))
+    try:
+        ov.set_chat("1群")
+        ov.app.processEvents()
+        assert ov.autoChatRow.isVisible(), "独立窗口的会话该出现「允许自动回复」那一行"
+        assert ov.autoChatSwitch.isChecked() is False, "新窗口默认必须是不允许"
+        assert ov.autoChatNote.text(), "没授权时该有一句说明，别让用户以为功能坏了"
+
+        # 主窗口（回退路径）的会话：这一行必须消失
+        ov.set_chat("小分队")
+        ov.app.processEvents()
+        assert not ov.autoChatRow.isVisible(), "主窗口的会话不该出现这一行（老行为不许变）"
+
+        # 拨开关：交回 main，而且重画之后停在新状态上
+        ov.set_chat("1群")
+        ov.app.processEvents()
+        ov.autoChatSwitch.setChecked(True)
+        ov.app.processEvents()
+        assert changed == [("1群", True)], changed
+        assert st.auto_chat("1群") is True, "拨了开关就该存下来"
+        assert ov.autoChatSwitch.isChecked() is True, "重画之后开关该停在「允许」上"
+        assert st.auto_chat("小分队") is False, "别的会话不该被一起打开"
+
+        # 切走再切回来：状态要从配置里读回来，不能停在界面的残留值上
+        ov.set_chat("小分队")
+        ov.app.processEvents()
+        ov.set_chat("1群")
+        ov.app.processEvents()
+        assert ov.autoChatSwitch.isChecked() is True, "切回来该还是「允许」"
+
+        ov.autoChatSwitch.setChecked(False)
+        ov.app.processEvents()
+        assert changed == [("1群", True), ("1群", False)], changed
+        assert st.auto_chat("1群") is False
+    finally:
+        ov.win.hide()
+    print("首页「允许自动回复」那一行 ok（只对独立窗口出现 / 状态跟着会话走 / 存得下来）")
+
+
+def check_session_tabs() -> None:
+    """会话标签页（D11）：把「有自己独立窗口的会话」摊平了摆出来，点一下只换看谁。
+
+    守四件事：
+    1. **不够两个独立窗口就整行不出现**——单会话用户（包括所有老用户、以及不传
+       own_window_of 的离线工具）看到的界面必须一个像素都不变；
+    2. 主窗口（回退路径）的会话**不许**上标签页，也不该把标签页顶掉；
+    3. 点标签页只换悬浮窗在看谁，**微信那边一个都不动**，而且下拉框要跟着走——
+       两边各说各话的话，用户会以为点了没反应；
+    4. 独立窗口关掉之后标签页要收起来、按钮要清干净（不然下次重建会越堆越多）。
+    """
+    owned = {"1群", "老婆"}
+    ov = Overlay(on_fill=lambda *a: None, own_window_of=lambda t: t in owned)
+    try:
+        ov.set_chat("1群")
+        ov.app.processEvents()
+        assert not ov.sessionTabs.isVisible(), "只有一个独立窗口时不该出现标签页"
+
+        ov.set_chat("老婆")
+        ov.app.processEvents()
+        assert ov.sessionTabs.isVisible(), "两个独立窗口该出现标签页"
+        titles = [b.text() for b in ov._tabButtons]
+        assert titles == ["1群", "老婆"], f"标签页该按会话出现顺序排：{titles}"
+
+        active, idle = ov._tabButtons[1].styleSheet(), ov._tabButtons[0].styleSheet()
+        assert active and idle and active != idle, \
+            "当前正看着的那个标签该有高亮，跟别的按钮长得不一样"
+
+        # 主窗口的会话进下拉框：它没有独立窗口，所以既不上标签页，也不该把标签页顶掉
+        ov.set_chat("小分队")
+        ov.app.processEvents()
+        assert ov.sessionTabs.isVisible(), "主窗口的会话不该把标签页顶掉"
+        assert [b.text() for b in ov._tabButtons] == ["1群", "老婆"], "主窗口的会话不该上标签页"
+        assert ov._tabButtons[1].styleSheet() == idle, "看的不是标签页上的会话时不该有高亮"
+
+        # 点标签页：只换在看谁，微信那边不动；下拉框要跟着走
+        ov._tabButtons[1].click()
+        ov.app.processEvents()
+        assert ov.current_chat() == "老婆", f"点了该切过去，实际 {ov.current_chat()!r}"
+        assert ov.chatBox.currentText() == "老婆", "下拉框得跟着走，两边不能各说各话"
+        assert ov._tabButtons[1].styleSheet() == active, "切过去之后该轮到它高亮"
+        assert ov._tabButtons[0].styleSheet() == idle, "切走之后原来那个该灭掉"
+
+        # 独立窗口关掉一个：标签页该收起来，按钮清干净
+        owned.discard("老婆")
+        ov.refresh_windows()
+        ov.app.processEvents()
+        assert not ov.sessionTabs.isVisible(), "只剩一个独立窗口了，标签页该收起来"
+        assert ov._tabButtons == [], f"收起来时按钮要清干净：{ov._tabButtons}"
+
+        # 没给 own_window_of（离线工具就是这么构造的）：永远不出现
+        ov3 = Overlay(on_fill=lambda *a: None)
+        try:
+            ov3.set_chat("1群")
+            ov3.set_chat("老婆")
+            ov3.app.processEvents()
+            assert not ov3.sessionTabs.isVisible(), "没给 own_window_of 时标签页不该出现"
+            assert ov3._tabButtons == []
+        finally:
+            ov3.win.hide()
+    finally:
+        ov.win.hide()
+    print("会话标签页 ok（≥2 个独立窗口才出现 / 点一下只换看谁 / 窗口关了会收起来）")
+
+
 if __name__ == "__main__":
     path = _tmp_config({"relationship": "朋友", "retries": 2})
     try:
@@ -436,6 +558,8 @@ if __name__ == "__main__":
         check_candidate_control(ov)
         check_group_name_warning(ov)
         check_config_problem_reaches_ui(ov)
+        check_auto_chat_row(path)
+        check_session_tabs()
     finally:
         try:
             os.unlink(path)

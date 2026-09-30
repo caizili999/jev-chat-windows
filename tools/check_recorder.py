@@ -386,7 +386,8 @@ def check_main_fork(tmp):
                          log_message=lambda *a, **k: None, set_targets=lambda *a: None,
                          set_busy=lambda *a: None, set_status=lambda *a, **k: None,
                          log=lambda *a: None, after=lambda *a: None,
-                         auto_pending=lambda: False)
+                         set_chat=lambda *a: None, auto_pending=lambda: False,
+                         cancel_auto=lambda *a, **k: None, refresh_windows=lambda: None)
     ts = datetime(2026, 9, 24, 14, 15)
     started = []
     # ov / q 只在 __main__ 那段里才存在，import 进来的 main 没有这两个属性，直接造给它。
@@ -394,9 +395,12 @@ def check_main_fork(tmp):
     # 恢复时按「原本有没有」来：原本没有的要删掉，别把假对象留在 main 里给后面的检查看见。
     names = ("chats", "ov", "q", "history_rec", "start_analyze")
     real = {k: vars(main).get(k, _MISSING) for k in names}
-    real_area = main.state["area"]
+    real_wins, real_chat = main.state["wins"], main.state["chat"]
     main.ov = ov
-    main.q = FakeQ([("lines", "小分队", [("her", "阿杰", "你好", ts)], (0, 0, 10, 10))])
+    # 先来一条 session：会话名 → 窗口的映射就是这么建立的（多独立窗口协议）。
+    # 少了它 win_of("小分队") 是 None，后面那条 lines 里的坐标就没地方落。
+    main.q = FakeQ([("session", 7, "小分队", True),
+                    ("lines", "小分队", [("her", "阿杰", "你好", ts)], (0, 0, 10, 10))])
     main.history_rec = recorder.Recorder(os.path.join(tmp, "记录"))
     main.chats = {}
     main.start_analyze = lambda title, msgs, auto_ok=False: started.append((title, list(msgs)))
@@ -405,6 +409,8 @@ def check_main_fork(tmp):
         hist = main.chats["小分队"]["history"]
         assert list(hist) == [("her", "你好", "阿杰")], f"history 必须还是三元组：{list(hist)}"
         assert started == [("小分队", [("her", "你好", "阿杰")])], started
+        assert main.state["wins"]["小分队"]["area"] == (0, 0, 10, 10), \
+            "lines 里带的坐标要落到这个会话的窗口上（fill_reply 靠它）"
         # 记录器是攒批写的，close() 才会 flush；不 close 就读文件会读空
         main.history_rec.close()
         rows = _rows(os.path.join(tmp, "记录"), "小分队", "2026-09-24")
@@ -415,7 +421,7 @@ def check_main_fork(tmp):
                 delattr(main, k)
             else:
                 setattr(main, k, v)
-        main.state["area"] = real_area
+        main.state["wins"], main.state["chat"] = real_wins, real_chat
     print("main.drain() 分叉（history 不变 + 记录器拿到时间） ok")
 
 

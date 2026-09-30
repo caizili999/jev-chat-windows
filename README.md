@@ -461,6 +461,22 @@ PyCharm / VS Code 里直接 Run `main.py` 也行。
 行为跟没有这个功能完全一样。（上面两张图用 `tools/preview_ui.py --kb` / `--kb-window` 生成，
 演示数据建在临时目录里。）
 
+<table>
+<tr>
+<td width="50%"><img src="docs/ui_multi_window.png" alt="多独立窗口"></td>
+<td width="50%"><img src="docs/ui_kb_windows.png" alt="窗口配对"></td>
+</tr>
+<tr>
+<td align="center">多独立窗口：首页多一行会话标签页（当前在看的那个高亮），每个窗口单独授权是否自动回复</td>
+<td align="center">知识库与联系人：把每个窗口标题配到联系人（写进它的别名），配好之后两边的历史和关系备注是同一份</td>
+</tr>
+</table>
+
+上面这一组是多独立窗口那条线（微信 4.0.5+ 的「在独立窗口中打开」）。
+**不开独立窗口的话，界面和请求跟没有这个功能时一模一样**——会话标签页整行不出现，
+授权那一行也不出现，会话名还是从微信窗口头部 OCR 来的。
+（用 `tools/preview_ui.py --multi-window` / `--multi-window --kb --kb-window` 生成。）
+
 ## 隐私与边界
 
 这是个人自用工具，下面几条是硬约束，代码里就是这么写的：

@@ -14,7 +14,9 @@
 --state auto 额外把「N 秒后自动发送」那条倒计时摆出来；
 --kb 让知识库那一块出现（设置页那张卡 + 首页那行计数 +「存为联系人」按钮），
 --kb-window 直接把「知识库与联系人」管理窗口截下来，
---kb-nothing 让首页那行改演「已识别到联系人，但没有可补的内容」那一态。
+--kb-nothing 让首页那行改演「已识别到联系人，但没有可补的内容」那一态，
+--multi-window 演多独立窗口（首页的会话标签页 +「允许自动回复」那一行；
+配合 --kb --kb-window 还能截到知识库窗口那栏「当前看到的窗口」）。
 
 **知识库的演示数据建在临时目录里**（`--kb` 时），跟「不碰真实数据」这条承诺一致。
 """
@@ -49,6 +51,15 @@ _MESSAGES = (
 )
 _GROUP = "示例群"
 _SENDERS = ("张三", "李四")  # 最近说话的排最前，跟 main.py 那边一个口径
+
+# 多独立窗口演示（--multi-window）。屏幕上开着两个独立聊天窗口，会话名就是窗口标题。
+# 名字必须明显虚构；而且要**故意留一个跟知识库联系人对不上的**——「还没配到联系人」
+# 正是这条路上最要紧的一态（会话名从 OCR 头部改成窗口标题之后，现有联系人会对不上）。
+_MULTI_WINDOWS = ("示例群", "示例项目群")
+_MULTI_MESSAGES = (
+    ("示例项目群", "her", "这版大概什么时候能发？", "王五", "10:02"),
+    ("示例项目群", "her", "我这边随时能联调", "王五", "10:05"),
+)
 
 _CANDIDATES = [
     "周六六点没问题，上次那家见～",
@@ -166,6 +177,10 @@ def main() -> int:
     parser.add_argument("--kb-nothing", action="store_true",
                         help="首页那行改演示「已识别到联系人，但没有可补的内容」那一态"
                              "（隐含 --kb）。它跟「未使用知识库」是两句不同的话")
+    parser.add_argument("--multi-window", action="store_true",
+                        help="演示多独立窗口：屏幕上开着两个独立聊天窗口。首页出现会话标签页，"
+                             "「允许自动回复」那一行也露出来；配合 --kb-window 还能看到"
+                             "知识库窗口那栏「当前看到的窗口」（其中一个是「还没配到联系人」）")
     args = parser.parse_args()
     if args.kb_window or args.kb_nothing:
         args.kb = True
@@ -315,6 +330,10 @@ def main() -> int:
         auto_send_delay=lambda: demo_settings["auto_send_delay"],
         send_key=lambda: demo_settings["send_key"],
         my_name=lambda: demo_settings["my_name"],
+        # 按会话的自动回复授权（多独立窗口）：也是读真实 config.json 的，必须桩掉。
+        # 演示图里统一按「没授权」拍——那正是新窗口的默认状态。
+        auto_chat=lambda title: False,
+        save_auto_chat=lambda title, on: None,
         draft_timeout=lambda: demo_settings["draft_timeout"],
         judge_timeout=lambda: demo_settings["judge_timeout"],
         candidate_count=lambda: demo_settings["candidate_count"],
@@ -348,7 +367,16 @@ def main() -> int:
                      on_auto_send=simulate_auto, on_settings_change=lambda: None,
                      on_toggle_judge=lambda on: ov.set_status(
                          "演示模式：判断已" + ("开启" if on else "关闭") + "（未写配置）。", "success"),
+                     # 演示「独立窗口」那一行：假报「这个会话有自己的窗口」，好让
+                     # 「允许自动回复」那一行出现在演示图里（真实情况下它只对独立窗口的会话出现）。
+                     own_window_of=lambda t: True,
+                     on_auto_chat_change=lambda t, on: ov.set_status(
+                         f"演示模式：「{t}」已{'允许' if on else '不允许'}自动回复（未写配置）。",
+                         "success"),
                      kb=demo_kb,
+                     # 知识库窗口那栏「当前看到的窗口」。--multi-window 才给（不给就整栏不出现，
+                     # 那正是离线工具和单窗口用户看到的界面）。
+                     windows_of=(lambda: list(_MULTI_WINDOWS)) if args.multi_window else None,
                      on_kb_change=lambda: ov.set_status("演示模式：知识库内容已变（未写真实文件）。",
                                                         "success"))
         ov.win.setWindowTitle("WeChatJev · 界面演示（合成数据）")
@@ -361,6 +389,10 @@ def main() -> int:
         else:
             for chat, who, text, name, timestamp in _MESSAGES:
                 ov.log_message(who, text, name, timestamp=timestamp, chat=chat)
+            if args.multi_window:
+                # 第二个独立窗口的消息。会话名进下拉框 → 会话标签页那一行才够两个。
+                for chat, who, text, name, timestamp in _MULTI_MESSAGES:
+                    ov.log_message(who, text, name, timestamp=timestamp, chat=chat)
             ov.set_targets(_GROUP, _SENDERS, _SENDERS[0])  # 群聊才有回复对象这一行
             ov.set_chat(_CHAT)
             ov.show(result)
@@ -408,6 +440,9 @@ def main() -> int:
                     if args.kb_window:
                         # 管理窗口是**独立的顶层窗口**，要截的是它，不是悬浮窗
                         ov._open_kb()
+                        if args.multi_window:
+                            # 「当前看到的窗口」那一栏在联系人页里，停在笔记页拍不到
+                            ov.kbWindow.select_contacts()
                         ov.app.processEvents()
                         shot = ov.kbWindow
                     else:

@@ -258,6 +258,38 @@ class KbStore:
         self.save_contact(replace(existing, apps=apps, aliases=aliases))
         return f"已并入联系人「{existing.name}」"
 
+    def add_alias(self, contact_id: str, alias: str) -> bool:
+        """给某个联系人补一条别名。**知识库窗口那栏「当前看到的窗口」用的就是它。**
+
+        为什么需要单独一条路：上面 `save_or_merge_contact` 那个「并入」分支**永远不成立**
+        （能走到那儿就说明 `normalize_name(title)` 已经匹配上了某个联系人，那它必然在 known 里），
+        所以「一键存」根本记录不下新的拼写。
+
+        而多独立窗口这条路最要紧的一步恰恰是「把窗口标题写进别名」：会话名从「OCR 头部」
+        改成「Windows 窗口标题」之后，窗口标题跟现有联系人**一个都对不上**——
+        `1群` vs `1群(4)Q`（那个 Q 是 OCR 把 🔍 认成的字）、
+        `程序员烧烤🦞技术交流群v3.0` vs `程序员烧烤技术交流群v3.0`（存的时候 🦞 丢了）。
+        不配一次，那 98/23/15 条历史会**静默**对不上，首页只会显示「本轮未使用知识库」。
+
+        返回是否真的写下去了（已经在了 / 联系人不存在 / 空别名都返回 False）。
+
+        ⚠️ 非 str 一律拒绝，**刻意不做 `str()` 强转**：强转出来的 `"123"` 是一条
+        看起来完全合法的别名，会一路把这个联系人配到一个不存在的会话上。方向永远是
+        「宁可这条别名不要」（跟 app/windows.py 的 `session_name()` 同一个口径）。
+        """
+        if not isinstance(alias, str) or not alias.strip():
+            return False
+        alias = alias.strip()
+        with self._lock:
+            c = next((x for x in self._load_contacts() if x.id == contact_id), None)
+            if c is None:
+                return False
+            want = normalize_name(alias)
+            known = [normalize_name(c.name)] + [normalize_name(a) for a in c.aliases]
+            if not want or want in known:
+                return False
+            return self.save_contact(replace(c, aliases=list(c.aliases) + [alias]))
+
     # ── 历史 ────────────────────────────────────────────────────────────────
 
     def append_log(self, contact_id: str, entries, screen_batch: bool = True) -> bool:

@@ -12,6 +12,11 @@ parent 还挂在布局里（占着位置留一块空白），静态检查都发�
   - 「记录历史开着、条数是 0」这条跨字段的静默失效有没有被说出来（_kb_hint）；
   - 清空知识库之后那个已经建好的窗口有没有被销毁（不然它显示的还是已删掉的条目）。
 
+还有一条**多独立窗口专属**的：「当前看到的窗口」那栏（check_windows_column）。
+会话名从 OCR 头部改成 Windows 窗口标题之后，现有联系人一个都对不上，不配一次那些
+历史会静默失效——所以「点一下把窗口标题写进别名」这条链路必须真的通，而且
+**不给 windows_of 时那栏一个像素都不能露**（离线工具和单窗口用户看到的是老界面）。
+
 跑法：python tools/check_kb_ui.py   （通过 exit 0，失败抛 AssertionError 并 exit 1）
 
 **绝不碰用户真实数据**：config.json 指到临时文件；知识库 store 建在临时目录上；
@@ -30,6 +35,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # 必须在 import PySide6 之前
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+from PySide6.QtWidgets import QWidget  # noqa: E402
 
 from app import settings  # noqa: E402
 from app.kb import KbStore  # noqa: E402
@@ -272,6 +279,231 @@ def check_open_and_clear(ov, store, toasts) -> None:
     assert any("已清空" in t for t in toasts), f"toast 文案不对：{toasts}"
 
 
+# ── 7b. 「当前看到的窗口」那栏：窗口标题 → 联系人别名 ─────────────────────────
+#
+# 这一栏是**多独立窗口这条路最要紧的一步**，所以单独钉住。会话名从「OCR 主窗口头部」
+# 改成「Windows 窗口标题」之后，窗口标题跟现有联系人一个都对不上——真实例子里是
+# `1群` vs `1群(4)Q`（那个 Q 是 OCR 把 🔍 搜索图标认成的字）。不配一次，那几十上百条
+# 历史会**静默**对不上：首页只是从「用了知识库」变成「本轮未使用知识库」，
+# 用户只会以为功能坏了。点一下把窗口标题写进别名，两条路就统一到同一个 key 了。
+#
+# 顺带钉住三条容易改坏的：
+#   - 不给 windows_of（离线工具、单窗口用户）时整栏**不能出现**，否则界面就变了；
+#   - 给了但一个独立窗口都没开 → 同样不出现，不留一块空卡片；
+#   - 拿窗口列表时抛异常 → 窗口照样打得开（那栏只是锦上添花，不该拖垮整个窗口）。
+
+def _texts(root) -> list:
+    """把一棵控件树里所有静态文案收出来（标签、按钮都算），用来断言「那栏在不在」。"""
+    out = []
+    for widget in root.findChildren(QWidget):
+        getter = getattr(widget, "text", None)
+        if not callable(getter):
+            continue
+        try:
+            value = getter()
+        except TypeError:      # 少数控件 text() 要参数，跳过
+            continue
+        if isinstance(value, str):
+            out.append(value)
+    return out
+
+
+def _by_accessible(root, name: str):
+    """按 accessibleName 找控件。**不靠下标**——布局顺序改一次，下标断言就假绿了。"""
+    for widget in root.findChildren(QWidget):
+        if widget.accessibleName() == name:
+            return widget
+    return None
+
+
+def _open_contacts(ov):
+    """打开知识库窗口并切到「联系人」页。"""
+    ov._open_kb()
+    ov.kbWindow._select(1)
+    ov.app.processEvents()
+    return ov.kbWindow
+
+
+def _close_ov(ov) -> None:
+    try:
+        if ov.kbWindow is not None:
+            ov.kbWindow.close()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ov.win.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def check_windows_column(store, toasts) -> None:
+    store.clear_all()
+    # 「1群(4)Q」是真实存在的旧名字（Q 是 OCR 认错的 🔍）；「老婆」两个名字本来就对得上。
+    store.save_contact(Contact(id="w1", name="1群(4)Q", apps=["wechat"]))
+    store.save_contact(Contact(id="w2", name="老婆", apps=["wechat"]))
+
+    titles = ["1群", "老婆"]
+    changed = []
+    ov = Overlay(on_fill=lambda *a: None, kb=store,
+                 on_kb_change=lambda: changed.append(1),
+                 windows_of=lambda: list(titles))
+    try:
+        ov.win.show()
+        win = _open_contacts(ov)
+
+        texts = _texts(win)
+        assert "当前看到的窗口" in texts, f"有独立窗口时该有那栏：{texts}"
+        assert "1群" in texts and "老婆" in texts, f"两个窗口标题都该列出来：{texts}"
+        # 名字就对得上的（老婆）→ 已配到；对不上的（1群）→ 还没配到
+        assert any("已配到「老婆」" in t for t in texts), f"该认出「老婆」：{texts}"
+        assert sum(1 for t in texts if "还没配到联系人" in t) == 1, \
+            f"只有「1群」还没配到：{texts}"
+        # 已经配上的那个，下拉框要**预选**在它身上：不然一边写着「已配到『老婆』」、
+        # 下拉里却是别人，看着像显示错了
+        paired = _by_accessible(win, "把「老婆」配到哪个联系人")
+        assert paired is not None and paired.currentText() == "老婆", \
+            f"已配上的窗口该预选在那个联系人上，实际 {getattr(paired, 'currentText', lambda: '?')()!r}"
+
+        # 点「配到…」，把窗口标题写进「1群(4)Q」的别名
+        pick = _by_accessible(win, "把「1群」配到哪个联系人")
+        button = _by_accessible(win, "把「1群」配到选中的联系人")
+        assert pick is not None and button is not None, "每个窗口都该有下拉和「配到…」按钮"
+        index = pick.findText("1群(4)Q")
+        assert index >= 0, \
+            f"下拉里该有「1群(4)Q」，实际 {[pick.itemText(i) for i in range(pick.count())]}"
+        pick.setCurrentIndex(index)
+        toasts.clear()
+        button.click()
+        ov.app.processEvents()
+
+        hit = store.find_contact("1群", "wechat")
+        assert hit is not None and hit.name == "1群(4)Q", \
+            f"配完「1群」该命中「1群(4)Q」，实际 {getattr(hit, 'name', None)}"
+        assert "1群" in hit.aliases, f"窗口标题该进别名：{hit.aliases}"
+        assert changed, "配对之后该通知外面刷新"
+        assert any("已把「1群」配到" in t for t in toasts), f"该给一句 toast：{toasts}"
+
+        # 界面上那行也要跟着变成「已配到」
+        texts = _texts(win)
+        assert any("已配到「1群(4)Q」" in t for t in texts), f"配完该显示已配到：{texts}"
+        assert not any("还没配到联系人" in t for t in texts), f"都配完了不该还剩：{texts}"
+        repick = _by_accessible(win, "把「1群」配到哪个联系人")
+        assert repick is not None and repick.currentText() == "1群(4)Q", \
+            "配完之后下拉该预选在那个联系人上（不然用户以为没配上）"
+
+        # 再点一次：是「已经在」，不能堆第二条别名（refresh 会重建控件，得重新找）
+        before = list(store.find_contact("1群", "wechat").aliases)
+        pick = _by_accessible(win, "把「1群」配到哪个联系人")
+        button = _by_accessible(win, "把「1群」配到选中的联系人")
+        pick.setCurrentIndex(pick.findText("1群(4)Q"))
+        toasts.clear()
+        button.click()
+        ov.app.processEvents()
+        after = store.find_contact("1群", "wechat").aliases
+        assert after == before, f"重复配不该堆别名：{before} → {after}"
+        assert any("已经在" in t for t in toasts), f"第二次该说已经在：{toasts}"
+    finally:
+        _close_ov(ov)
+
+    # ① 不给 windows_of：整栏不出现（离线工具 / 单窗口用户看到的界面一个像素都不能变）
+    ov2 = Overlay(on_fill=lambda *a: None, kb=store)
+    try:
+        win2 = _open_contacts(ov2)
+        assert "当前看到的窗口" not in _texts(win2), "没给 windows_of 时那栏不该出现"
+    finally:
+        _close_ov(ov2)
+
+    # ② 给了但一个独立窗口都没开：同样不出现，不留一块空卡片
+    ov3 = Overlay(on_fill=lambda *a: None, kb=store, windows_of=lambda: [])
+    try:
+        win3 = _open_contacts(ov3)
+        assert "当前看到的窗口" not in _texts(win3), "没有独立窗口时不该留一块空卡片"
+    finally:
+        _close_ov(ov3)
+
+    # ③ 拿窗口列表时抛异常：窗口照样要打得开（这栏只是锦上添花）
+    def _boom():
+        raise OSError("拿不到窗口列表")
+
+    ov4 = Overlay(on_fill=lambda *a: None, kb=store, windows_of=_boom)
+    try:
+        win4 = _open_contacts(ov4)
+        assert "当前看到的窗口" not in _texts(win4), "拿不到窗口列表时那栏该安静地不出现"
+        assert "联系人" in _texts(win4) or "新建联系人" in _texts(win4), \
+            "那栏出不来也不该把整个联系人页带塌"
+    finally:
+        _close_ov(ov4)
+
+
+# ── 7c. 「有个窗口还没配到联系人」那条提示 ────────────────────────────────────
+#
+# 这条提示**必须非模态**：调用它的是 main 的 tick()，而 `ov.after(50, tick)` 是 tick() 的
+# **最后一行**。在 tick() 里弹模态框（MessageBoxBase.exec()）会让父进程彻底停死——
+# 子进程还在截图、队列一直堆、没人消费（DESIGN_MULTIWINDOW §6.3）。
+# 「它是不是模态的」光看代码看不出来，只能真构造一遍再问 isModal()。
+
+def check_unpaired_hint(ov, store) -> None:
+    from PySide6.QtWidgets import QDialog, QPushButton
+    from qfluentwidgets import InfoBar
+
+    kb_ui = overlay_mod.kb_ui
+
+    # ① 真的把它建出来（不是桩），确认不是模态框
+    ov.win.show()
+    opened = []
+    bar = kb_ui.toast_unpaired(ov.win, "1群", on_open=lambda: opened.append(1))
+    assert bar is not None, "提示条该建得出来"
+    assert not isinstance(bar, QDialog), "提示条**绝不能**是模态对话框——它是在主循环里弹的"
+    assert not bar.isModal(), "提示条不能是模态的"
+    ov.app.processEvents()
+
+    # ② 得有一个「去配对」按钮，点了会回调出去
+    buttons = [b for b in bar.findChildren(QPushButton) if b.text() == "去配对"]
+    assert buttons, "提示条上该有「去配对」——光说一句对不上，用户还是不知道点哪儿"
+    buttons[0].click()
+    ov.app.processEvents()
+    assert opened == [1], "点了「去配对」该回调出去"
+    # 点完不用再 close()：qfluentwidgets 的 InfoBar 关掉会自己析构，
+    # 再碰 `bar` 会 `RuntimeError: Internal C++ object already deleted`（正好也证明了它真关了）。
+
+    # ③ 传错 parent 不该崩（跟 toast 一个口径：它只负责好看，出不来也不能把采集拖垮）
+    try:
+        kb_ui.toast_unpaired(object(), "1群")
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(
+            f"toast_unpaired 收到非控件 parent 时抛了 {type(e).__name__}: {e}") from e
+    ov.app.processEvents()
+
+    # ④ 有知识库、标题对不上 → 真冒一条；没有知识库 → 一条都不冒
+    #    （没有 store 时根本没有「配到联系人」这回事，凭空冒提示就破坏了
+    #     「不加知识库就逐字节不变」这条最硬的约束）
+    before = len(ov.win.findChildren(InfoBar))
+    ov.notify_unpaired("1群")
+    ov.app.processEvents()
+    assert len(ov.win.findChildren(InfoBar)) > before, "有知识库时该冒一条提示"
+
+    bare = Overlay(on_fill=lambda *a: None)
+    try:
+        bare.win.show()
+        bare.app.processEvents()
+        before = len(bare.win.findChildren(InfoBar))
+        bare.notify_unpaired("1群")
+        bare.app.processEvents()
+        assert len(bare.win.findChildren(InfoBar)) == before, "没有知识库时不该冒提示条"
+    finally:
+        bare.win.hide()
+
+    # ⑤ 真正的接线：回调是 _open_kb_for_pairing —— 开窗口 **并停在联系人页**
+    #    （「当前看到的窗口」那一栏在联系人页里，停在笔记页用户还是找不到）
+    ov.kbWindow = None
+    ov._open_kb_for_pairing()
+    ov.app.processEvents()
+    assert ov.kbWindow is not None, "「去配对」该把知识库窗口开出来"
+    assert ov.kbWindow._tab == 1, "而且要直接停在联系人页"
+    ov.kbWindow.close()
+    ov.kbWindow = None
+
+
 # ── 8. 自检那条线真的通 ─────────────────────────────────────────────────────
 
 def check_selfcheck(ov, store) -> None:
@@ -453,6 +685,8 @@ if __name__ == "__main__":
         check_context_line(ov)
         check_save_contact(ov, store, toasts)
         check_open_and_clear(ov, store, toasts)
+        check_windows_column(store, toasts)
+        check_unpaired_hint(ov, store)
         check_selfcheck(ov, store)
         check_main_wiring(ov, store, path)
         check_toast_parent(ov, store, fake_toast)
@@ -465,6 +699,6 @@ if __name__ == "__main__":
         shutil.rmtree(kb_root, ignore_errors=True)
     print("悬浮窗知识库接线检查通过"
           "（无库时全隐藏 / 有库时可见 / 设置往返 / 跨字段提示 / 一键存 / 清空 / 自检 / "
-          "main 接线 / 提示条的 parent 是真控件）",
+          "main 接线 / 提示条的 parent 是真控件 / 「当前看到的窗口」配对 / 未配对提示非模态）",
           flush=True)
     os._exit(0)
